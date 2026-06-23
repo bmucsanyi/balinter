@@ -1,0 +1,18 @@
+# Third-party licenses
+
+balinter ships as a compiled binary that statically links the Rust crates listed
+below. Their licenses are reproduced in full, as required by those licenses.
+
+{{#each licenses}}
+## {{name}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+```
+{{{text}}}
+```
+
+{{/each}}

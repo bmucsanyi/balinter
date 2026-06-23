@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "balinter"
+version = "0.1.0"
+description = "Opinionated linter for sprawling codebases"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE", "THIRD-PARTY-LICENSES.md", "licenses/ruff-LICENSE.txt"]
+
+[tool.maturin]
+bindings = "bin"
