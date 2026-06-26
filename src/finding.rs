@@ -9,17 +9,22 @@ pub struct Finding {
 /// Stable short code for each rule, used in output and in `# noqa: BAL00X`.
 pub fn rule_code(rule: &str) -> &'static str {
     match rule {
-        "BLOAT-REPO" => "BAL001",
-        "BLOAT-FILE" => "BAL002",
-        "BLOAT-DENSITY" => "BAL003",
-        "DUP-FAMILY" => "BAL004",
-        "TEST-MOCK" => "BAL005",
-        "TEST-ABSENT" => "BAL006",
-        "GUARD-FALLBACK" => "BAL007",
-        "GUARD-SILENT-DEFAULT" => "BAL008",
-        "TEST-MOCK-SUT" => "BAL009",
-        "TEST-WEAK" => "BAL010",
-        "COMMENT-NOISE" => "BAL011",
+        "bloat-repo" => "BAL001",
+        "bloat-file" => "BAL002",
+        "bloat-density" => "BAL003",
+        "dup-family" => "BAL004",
+        "test-mock" => "BAL005",
+        "test-absent" => "BAL006",
+        "guard-fallback" => "BAL007",
+        "guard-silent-default" => "BAL008",
+        "test-mock-sut" => "BAL009",
+        "test-weak" => "BAL010",
+        "comment-noise" => "BAL011",
+        "banned-word" => "BAL012",
+        "stub" => "BAL013",
+        "abstraction-solo" => "BAL014",
+        "dup-body" => "BAL015",
+        "doc-bloat" => "BAL016",
         _ => "BAL000",
     }
 }

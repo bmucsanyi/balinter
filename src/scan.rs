@@ -1,7 +1,10 @@
-use crate::astrules::{self, FuncSig};
+use crate::astrules::{self, ClassInfo, FuncSig};
+use crate::config::Config;
 use crate::finding::{rule_code, Finding};
 use crate::noqa;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -9,19 +12,21 @@ pub struct FileMetrics {
     pub path: PathBuf,
     pub loc: usize,
     pub is_test: bool,
-    pub defs: Vec<String>,
     pub test_fns: usize,
     pub mock_hits: usize,
     pub ast_findings: Vec<Finding>,
     pub func_sigs: Vec<FuncSig>,
+    pub classes: Vec<ClassInfo>,
 }
 
 pub struct Scan {
     pub files: Vec<FileMetrics>,
 }
 
-/// Walk `root` (gitignore-aware), then measure and parse every Python file.
-pub fn scan(root: &Path) -> Scan {
+/// Walk `root` (gitignore-aware, minus the configured excludes), then measure and parse
+/// every Python file.
+pub fn scan(root: &Path, cfg: &Config) -> Scan {
+    let exclude = build_exclude_set(&cfg.exclude);
     let mut paths: Vec<(PathBuf, PathBuf)> = Vec::new();
     for result in WalkBuilder::new(root).build() {
         let entry = match result {
@@ -42,21 +47,64 @@ pub fn scan(root: &Path) -> Scan {
                 .strip_prefix(root)
                 .unwrap_or(entry.path())
                 .to_path_buf();
+
+            if exclude.is_match(rel.as_path()) {
+                continue;
+            }
             paths.push((abs, rel));
         }
     }
 
     let package_dirs = package_dirs(&paths);
 
-    let mut files = Vec::new();
-    for (abs, rel) in &paths {
-        match analyze_file(abs, rel, &package_dirs) {
-            Ok(metrics) => files.push(metrics),
-            Err(err) => eprintln!("balinter: skipped {}: {err}", rel.display()),
+    // Parsing dominates; analyze files in parallel. rayon's collect preserves input order,
+    // and findings are sorted before output, so results are deterministic.
+    let files: Vec<FileMetrics> = paths
+        .par_iter()
+        .filter_map(
+            |(abs, rel)| match analyze_file(abs, rel, &package_dirs, &cfg.banned_words) {
+                Ok(metrics) => Some(metrics),
+                Err(err) => {
+                    eprintln!("balinter: skipped {}: {err}", rel.display());
+                    None
+                }
+            },
+        )
+        .collect();
+
+    Scan { files }
+}
+
+/// Build a matcher from the configured exclude patterns. A plain name (no glob characters,
+/// no slash) excludes that file or directory anywhere in the tree, like ruff; anything else
+/// is treated as a literal glob against the path relative to the root.
+fn build_exclude_set(patterns: &[String]) -> GlobSet {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let plain = !pattern.contains(['/', '*', '?', '[', ']']);
+        let globs = if plain {
+            vec![format!("**/{pattern}"), format!("**/{pattern}/**")]
+        } else {
+            vec![pattern.clone()]
+        };
+
+        for glob in globs {
+            match Glob::new(&glob) {
+                Ok(compiled) => {
+                    builder.add(compiled);
+                }
+                Err(err) => {
+                    eprintln!("balinter: invalid exclude pattern {glob:?}: {err}");
+                    std::process::exit(2);
+                }
+            }
         }
     }
 
-    Scan { files }
+    builder.build().unwrap_or_else(|err| {
+        eprintln!("balinter: could not build exclude set: {err}");
+        std::process::exit(2);
+    })
 }
 
 /// The repo's own directory names, so a first-party mock target can be told from an external one.
@@ -82,21 +130,17 @@ fn analyze_file(
     abs: &Path,
     rel: &Path,
     package_dirs: &HashSet<String>,
+    banned: &[String],
 ) -> std::io::Result<FileMetrics> {
     let bytes = std::fs::read(abs)?;
     let loc = bytes.iter().filter(|&&b| b == b'\n').count();
     let is_test = is_test_path(rel);
 
     let text = String::from_utf8_lossy(&bytes);
-    let mut defs = Vec::new();
     let mut test_fns = 0;
     let mut mock_hits = 0;
 
     for line in text.lines() {
-        if let Some(name) = top_level_def_name(line) {
-            defs.push(name);
-        }
-
         let trimmed = line.trim_start();
         if trimmed.starts_with("def test_") || trimmed.starts_with("async def test_") {
             test_fns += 1;
@@ -107,7 +151,7 @@ fn analyze_file(
         }
     }
 
-    let result = astrules::check_file(rel, &text, package_dirs);
+    let result = astrules::check_file(rel, &text, package_dirs, banned);
     let noqa = noqa::directives(&text);
     let ast_findings: Vec<Finding> = result
         .findings
@@ -124,30 +168,12 @@ fn analyze_file(
         path: rel.to_path_buf(),
         loc,
         is_test,
-        defs,
         test_fns,
         mock_hits,
         ast_findings,
         func_sigs: result.func_sigs,
+        classes: result.classes,
     })
-}
-
-/// Name of a function defined at module scope (column 0), or None.
-fn top_level_def_name(line: &str) -> Option<String> {
-    let rest = line
-        .strip_prefix("def ")
-        .or_else(|| line.strip_prefix("async def "))?;
-
-    let name: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
 }
 
 fn is_test_path(rel: &Path) -> bool {
@@ -187,18 +213,6 @@ fn line_has_mock(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn top_level_def_detection() {
-        assert_eq!(top_level_def_name("def foo(x):"), Some("foo".to_string()));
-        assert_eq!(
-            top_level_def_name("async def bar() -> int:"),
-            Some("bar".to_string())
-        );
-        assert_eq!(top_level_def_name("    def method(self):"), None);
-        assert_eq!(top_level_def_name("define_x = 1"), None);
-        assert_eq!(top_level_def_name("class Foo:"), None);
-    }
 
     #[test]
     fn test_path_classification() {

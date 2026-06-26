@@ -7,7 +7,9 @@ license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+globset = "0.4"
 ignore = "0.4"
+rayon = "1"
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.15.18", version = "0.0.0" }
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.15.18", version = "0.0.0" }
 ruff_text_size = { git = "https://github.com/astral-sh/ruff", tag = "0.15.18", version = "0.0.0" }

@@ -9,6 +9,9 @@ pub struct Config {
     pub max_mocks_per_test: f64,
     pub min_test_ratio: f64,
     pub test_absent_min_prod_loc: usize,
+    pub max_body_clones: usize,
+    pub banned_words: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 impl Default for Config {
@@ -21,8 +24,36 @@ impl Default for Config {
             max_mocks_per_test: 0.7,
             min_test_ratio: 0.05,
             test_absent_min_prod_loc: 2_000,
+            max_body_clones: 2,
+            banned_words: default_banned_words(),
+            exclude: Vec::new(),
         }
     }
+}
+
+/// Marketing and conversational slop with no technical meaning. Excludes terms with a
+/// real statistical sense (robust, powerful, leverage) and real CS terms (magic method,
+/// first-class). Replace wholesale, or empty, with `banned_words` in config.
+fn default_banned_words() -> Vec<String> {
+    [
+        "seamless",
+        "blazingly",
+        "effortless",
+        "cutting-edge",
+        "world-class",
+        "battle-tested",
+        "production-grade",
+        "production-ready",
+        "out-of-the-box",
+        "turnkey",
+        "supercharge",
+        "it's worth noting",
+        "feel free",
+        "as we can see",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -35,9 +66,29 @@ struct Overrides {
     max_mocks_per_test: Option<f64>,
     min_test_ratio: Option<f64>,
     test_absent_min_prod_loc: Option<usize>,
+    max_body_clones: Option<usize>,
+    banned_words: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
 }
 
 impl Config {
+    /// Walk up from `start` to the nearest directory holding a `pyproject.toml` or
+    /// `balinter.toml` and load config there, like ruff's config discovery. Defaults if none.
+    pub fn discover(start: &Path) -> Config {
+        let mut dir = if start.is_dir() {
+            Some(start)
+        } else {
+            start.parent()
+        };
+        while let Some(d) = dir {
+            if d.join("pyproject.toml").is_file() || d.join("balinter.toml").is_file() {
+                return Config::load(d);
+            }
+            dir = d.parent();
+        }
+        Config::default()
+    }
+
     /// Load defaults, then apply pyproject.toml `[tool.balinter]`, then balinter.toml.
     /// balinter.toml wins, mirroring how ruff prefers ruff.toml over pyproject.toml.
     pub fn load(root: &Path) -> Config {
@@ -84,6 +135,15 @@ impl Config {
         }
         if let Some(v) = o.test_absent_min_prod_loc {
             self.test_absent_min_prod_loc = v;
+        }
+        if let Some(v) = o.max_body_clones {
+            self.max_body_clones = v;
+        }
+        if let Some(words) = o.banned_words {
+            self.banned_words = words.into_iter().map(|w| w.to_ascii_lowercase()).collect();
+        }
+        if let Some(patterns) = o.exclude {
+            self.exclude = patterns;
         }
     }
 }

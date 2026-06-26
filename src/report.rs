@@ -1,8 +1,11 @@
 use crate::finding::{rule_code, Finding};
 use crate::scan::Scan;
+use std::collections::HashMap;
 
-pub fn print(scan: &Scan, findings: &[Finding], json: bool) {
-    if json {
+pub fn print(scan: &Scan, findings: &[Finding], json: bool, statistics: bool) {
+    if statistics {
+        print_statistics(findings, json);
+    } else if json {
         print_json(findings);
     } else {
         print_text(scan, findings);
@@ -57,6 +60,36 @@ fn print_json(findings: &[Finding]) {
 
     println!(
         "{}",
-        serde_json::to_string_pretty(&items).unwrap_or_else(|_| "[]".to_string())
+        serde_json::to_string_pretty(&items).expect("serialize findings to JSON")
     );
+}
+
+/// Per-rule counts, like ruff's `--statistics`. Sorted by count, then code.
+fn print_statistics(findings: &[Finding], json: bool) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for f in findings {
+        *counts.entry(f.rule).or_insert(0) += 1;
+    }
+    let mut rows: Vec<(&str, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| rule_code(a.0).cmp(rule_code(b.0)))
+    });
+
+    if json {
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(rule, count)| {
+                serde_json::json!({ "code": rule_code(rule), "rule": rule, "count": count })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&items).expect("serialize statistics to JSON")
+        );
+    } else {
+        for (rule, count) in rows {
+            println!("{count:>5}  {}  {rule}", rule_code(rule));
+        }
+    }
 }
