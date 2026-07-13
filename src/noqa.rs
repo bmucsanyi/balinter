@@ -1,50 +1,60 @@
+use crate::finding::{Rule, SourceLocator};
+use ruff_python_ast::token::{Token, TokenKind};
+use ruff_text_size::Ranged;
 use std::collections::HashMap;
 
 pub enum Noqa {
     All,
-    Codes(Vec<String>),
+    Rules(Vec<Rule>),
 }
 
 impl Noqa {
-    /// A bare `# noqa` suppresses anything; a coded one matches the rule's code or name.
-    pub fn suppresses(&self, rule: &str, code: &str) -> bool {
+    pub fn suppresses(&self, rule: Rule) -> bool {
         match self {
             Noqa::All => true,
-            Noqa::Codes(codes) => codes
-                .iter()
-                .any(|c| c.eq_ignore_ascii_case(rule) || c.eq_ignore_ascii_case(code)),
+            Noqa::Rules(rules) => rules.contains(&rule),
         }
     }
 }
 
-/// 1-based line number -> the `# noqa` directive on that line, if any.
-/// `# noqa` alone covers the whole line; `# noqa: BAL007, guard-fallback` covers the
-/// listed codes or rule names (ruff/flake8 convention).
-pub fn directives(source: &str) -> HashMap<usize, Noqa> {
+pub fn directives(source: &str, tokens: &[Token], locator: &SourceLocator) -> HashMap<usize, Noqa> {
     let mut map = HashMap::new();
-    for (index, line) in source.lines().enumerate() {
-        if let Some(noqa) = parse_line(line) {
-            map.insert(index + 1, noqa);
+    for token in tokens {
+        if token.kind() != TokenKind::Comment {
+            continue;
+        }
+        let range = token.range();
+        let text = &source[range.start().to_usize()..range.end().to_usize()];
+        if let Some(noqa) = parse_comment(text) {
+            let (line, _) = locator.location(range.start().to_usize());
+            map.insert(line, noqa);
         }
     }
     map
 }
 
-/// A `noqa` directive is `#` then optional whitespace then the word `noqa` (a passing
-/// mention like `# the noqa convention` is not one). Scans every `#` so a trailing
-/// `code  # noqa` or `# comment  # noqa` is still found.
-fn parse_line(line: &str) -> Option<Noqa> {
-    for (offset, _) in line.match_indices('#') {
-        let after = line[offset + 1..].trim_start();
-        if let Some(tail) = strip_noqa(after) {
-            return Some(parse_codes(tail));
+fn parse_comment(comment: &str) -> Option<Noqa> {
+    let mut found = false;
+    let mut rules = Vec::new();
+    for segment in comment.split('#').map(str::trim_start) {
+        let Some(tail) = strip_noqa(segment) else {
+            continue;
+        };
+        found = true;
+        let Some(rest) = tail.trim_start().strip_prefix(':') else {
+            return Some(Noqa::All);
+        };
+        if rest.trim().is_empty() {
+            return Some(Noqa::All);
         }
+        let selectors = rest
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|selector| !selector.is_empty());
+        rules.extend(selectors.filter_map(Rule::parse));
     }
-    None
+    found.then_some(Noqa::Rules(rules))
 }
 
-/// If `text` begins with the directive token `noqa` (followed by end, `:`, or whitespace),
-/// returns the remainder after it; otherwise None (so `noqacat` does not match).
 fn strip_noqa(text: &str) -> Option<&str> {
     let head = text.get(..4)?;
     if !head.eq_ignore_ascii_case("noqa") {
@@ -53,75 +63,39 @@ fn strip_noqa(text: &str) -> Option<&str> {
     let tail = &text[4..];
     match tail.chars().next() {
         None | Some(':') => Some(tail),
-        Some(c) if c.is_whitespace() => Some(tail),
+        Some(character) if character.is_whitespace() => Some(tail),
         Some(_) => None,
-    }
-}
-
-fn parse_codes(tail: &str) -> Noqa {
-    let Some(rest) = tail.trim_start().strip_prefix(':') else {
-        return Noqa::All;
-    };
-    let codes: Vec<String> = rest
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if codes.is_empty() {
-        Noqa::All
-    } else {
-        Noqa::Codes(codes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ruff_python_parser::parse_module;
 
-    #[test]
-    fn bare_noqa_suppresses_all() {
-        let directives = directives("x = fallback()  # noqa\n");
-        assert!(directives
-            .get(&1)
-            .unwrap()
-            .suppresses("guard-fallback", "BAL007"));
+    fn parse(source: &str) -> HashMap<usize, Noqa> {
+        let parsed = parse_module(source).unwrap();
+        directives(source, parsed.tokens(), &SourceLocator::new(source))
     }
 
     #[test]
-    fn coded_noqa_suppresses_only_that_code() {
-        let directives = directives("x = 1  # noqa: BAL007\n");
-        let noqa = directives.get(&1).unwrap();
-        assert!(noqa.suppresses("guard-fallback", "BAL007"));
-        assert!(!noqa.suppresses("test-weak", "BAL010"));
-    }
+    fn comments_are_parsed_and_strings_are_ignored() {
+        let directives = parse("x = 1  # noqa: BAL007, test-weak\n");
+        let directive = &directives[&1];
+        assert!(directive.suppresses(Rule::GuardFallback));
+        assert!(directive.suppresses(Rule::TestWeak));
+        assert!(!directive.suppresses(Rule::Stub));
 
-    #[test]
-    fn noqa_accepts_the_rule_name_too() {
-        let directives = directives("x = 1  # noqa: guard-fallback\n");
-        assert!(directives
-            .get(&1)
-            .unwrap()
-            .suppresses("guard-fallback", "BAL007"));
-    }
-
-    #[test]
-    fn no_directive_for_ordinary_comment() {
-        assert!(directives("x = 1  # ordinary comment\n").is_empty());
-    }
-
-    #[test]
-    fn mention_of_noqa_is_not_a_directive() {
-        // a comment that merely contains "noqa" must not suppress the line
-        assert!(directives("def f():  # the noqa convention is unrelated\n").is_empty());
-        assert!(directives("x = 1  # noqacat\n").is_empty());
-    }
-
-    #[test]
-    fn trailing_noqa_after_code_or_comment() {
-        assert!(directives("x = fallback()  # noqa\n").contains_key(&1));
-        // a noqa as a later comment segment is still found
-        let d = directives("x = 1  # type: ignore  # noqa: BAL007\n");
-        assert!(d.get(&1).unwrap().suppresses("guard-fallback", "BAL007"));
-        assert!(!d.get(&1).unwrap().suppresses("test-weak", "BAL010"));
+        let directives = parse("x = None  # type: ignore  # noqa: BAL008\n");
+        assert!(directives[&1].suppresses(Rule::GuardSilentDefault));
+        assert!(parse("seamless = \"# noqa \"\n").is_empty());
+        for spacing in ["", " ", "  ", "\t"] {
+            for selector in ["noqa", "NOQA", "noqa: BAL012", "noqa: guard-fallback"] {
+                let source = format!("value = \"#{spacing}{selector} \"\n");
+                assert!(parse(&source).is_empty(), "forged by {source:?}");
+            }
+        }
+        let directives = parse("x = 1  # noqa: BAD999\n");
+        assert!(!directives[&1].suppresses(Rule::BannedWord));
     }
 }

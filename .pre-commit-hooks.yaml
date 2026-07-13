@@ -3,6 +3,7 @@
   description: "Opinionated bloat and AI-slop linter, one layer above ruff"
   entry: balinter check
   language: python
-  types_or: [python, pyi]
+  types: [file]
+  files: '\.(py|pyi|ipynb)$'
   pass_filenames: false
   require_serial: true

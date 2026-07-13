@@ -1,106 +1,154 @@
-use crate::finding::Finding;
+use crate::config::Config;
+use crate::finding::{path_string, Finding, Rule, SourceLocator};
+use crate::noqa;
 use crate::rules::tokenize;
-use ruff_python_ast::token::TokenKind;
-use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{
-    CmpOp, Decorator, ExceptHandler, Expr, ExprCall, Parameters, Stmt, StmtClassDef,
-    StmtFunctionDef, StmtIf, StmtRaise, StmtTry,
+use ruff_python_ast::token::{Token, TokenKind};
+use ruff_python_ast::visitor::{
+    walk_except_handler, walk_expr, walk_pattern, walk_stmt, walk_with_item, Visitor,
 };
-use ruff_python_parser::parse_module;
+use ruff_python_ast::{
+    CmpOp, Comprehension, Decorator, ExceptHandler, Expr, ExprCall, Parameter, Parameters, Pattern,
+    PySourceType, Stmt, StmtClassDef, StmtFunctionDef, StmtRaise, StmtTry, WithItem,
+};
+use ruff_python_parser::{parse, parse_module, ParseOptions};
 use ruff_text_size::Ranged;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// A top-level function's name plus a hash of its body shape (statement kinds and the
-/// names it calls), for the repo-level DUP rules. `body_len` is the statement count,
-/// used to keep trivial one-liners out of the cross-name duplication check.
 pub struct FuncSig {
     pub name: String,
-    pub body_sig: u64,
+    pub qualified_name: String,
+    pub normalized_body: String,
     pub body_len: usize,
+    pub is_forwarder: bool,
+    pub line: usize,
+    pub cell: Option<usize>,
 }
 
-/// A class definition seen anywhere in a file, for the repo-level abstraction-solo rule.
 pub struct ClassInfo {
     pub name: String,
+    pub qualified_name: String,
     pub bases: Vec<String>,
     pub is_abstract: bool,
     pub is_protocol: bool,
+    pub abstract_methods: Vec<String>,
+    pub concrete_methods: Vec<String>,
     pub line: usize,
+    pub cell: Option<usize>,
 }
 
 pub struct FileResult {
     pub findings: Vec<Finding>,
     pub func_sigs: Vec<FuncSig>,
     pub classes: Vec<ClassInfo>,
+    pub callers: HashMap<String, HashSet<String>>,
+    pub ambiguous_calls: HashSet<String>,
+    pub test_fns: usize,
+    pub mock_calls: usize,
+    pub public_symbols: Option<usize>,
 }
 
-/// The lexical context threaded down the walk: the enclosing function's parameters (so
-/// guard-silent-default leaves the optional-argument idiom — a `None`-checked parameter —
-/// alone, while still flagging a defaulted local) and whether the immediately enclosing
-/// class is a `Protocol` (so stub leaves its bodyless members alone). ABC abstract methods
-/// are exempted per-method by their `@abstractmethod` decorator, so a plain `pass` method in
-/// an ABC still fires.
-#[derive(Clone, Copy)]
-struct Scope<'a> {
-    enclosing_params: &'a HashSet<String>,
-    in_interface: bool,
+pub struct FileOptions<'a> {
+    pub package_roots: &'a HashSet<String>,
+    pub is_stub_file: bool,
+    pub is_test_file: bool,
+    pub cell: Option<usize>,
+    pub config: &'a Config,
 }
 
-/// Run every parser-based per-file rule. `package_dirs` is the set of the repo's own
-/// directory names, used to tell a first-party mock target from an external one. `banned`
-/// is the configured slop vocabulary for banned-word.
+type LocalScope = (
+    bool,
+    HashMap<String, String>,
+    HashSet<String>,
+    HashSet<String>,
+);
+
 pub fn check_file(
     path: &Path,
     source: &str,
-    package_dirs: &HashSet<String>,
-    banned: &[String],
-) -> FileResult {
-    let parsed = match parse_module(source) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            eprintln!("balinter: parse error in {}: {err}", path.display());
-            return FileResult {
-                findings: Vec::new(),
-                func_sigs: Vec::new(),
-                classes: Vec::new(),
-            };
-        }
-    };
+    options: &FileOptions<'_>,
+) -> Result<FileResult, String> {
+    let package_dirs = options.package_roots;
+    let is_stub_file = options.is_stub_file;
+    let is_test_file = options.is_test_file;
+    let cell = options.cell;
+    let config = options.config;
+    let banned = &config.banned_words;
+    let parsed = if cell.is_some() {
+        parse(source, ParseOptions::from(PySourceType::Ipynb)).map(|parsed| {
+            parsed
+                .try_into_module()
+                .expect("IPython mode produces a module")
+        })
+    } else {
+        parse_module(source)
+    }
+    .map_err(|error| match cell {
+        Some(cell) => format!("parse error in {} cell {cell}: {error}", path.display()),
+        None => format!("parse error in {}: {error}", path.display()),
+    })?;
+    let locator = SourceLocator::new(source);
+    let imports = import_map(&parsed.syntax().body, path);
+    let module_functions = unshadowed_functions(&parsed.syntax().body);
+    let postponed_annotations = parsed.syntax().body.iter().any(|statement| {
+        matches!(statement, Stmt::ImportFrom(import) if import.module.as_ref().is_some_and(|module| module.as_str() == "__future__") && import.names.iter().any(|alias| alias.name.as_str() == "annotations"))
+    });
 
     let module = parsed.syntax();
     let mut checker = Checker {
-        source,
         path,
         package_dirs,
         banned,
+        locator: &locator,
+        imports: &imports,
+        module_functions: &module_functions,
+        postponed_annotations,
+        cell,
+        is_stub_file,
+        is_test_file,
+        config,
         findings: Vec::new(),
         func_sigs: Vec::new(),
         classes: Vec::new(),
+        callers: HashMap::new(),
+        ambiguous_calls: HashSet::new(),
+        test_fns: 0,
+        mock_calls: 0,
+        enclosing_params: HashSet::new(),
+        in_interface: false,
+        scope: Vec::new(),
+        local_scopes: Vec::new(),
+        direct_callee: false,
+        reported_identifiers: HashSet::new(),
     };
+    if has_star_import(&module.body) {
+        checker.ambiguous_calls.insert("*".to_string());
+    }
 
     for stmt in &module.body {
         if let Stmt::FunctionDef(func) = stmt {
-            let (body_sig, body_len) = body_signature(&func.body);
             checker.func_sigs.push(FuncSig {
                 name: func.name.as_str().to_string(),
-                body_sig,
-                body_len,
+                qualified_name: format!("{}.{}", module_name(path), func.name.as_str()),
+                normalized_body: normalized_body(source, parsed.tokens(), &func.body),
+                body_len: statement_count(&func.body),
+                is_forwarder: module_functions.contains(func.name.as_str())
+                    && func.decorator_list.is_empty()
+                    && is_forwarder(func),
+                line: locator.location(func.range.start().to_usize()).0,
+                cell,
             });
         }
     }
 
-    let no_params = HashSet::new();
-    let root = Scope {
-        enclosing_params: &no_params,
-        in_interface: false,
-    };
     checker.check_doc_prose(&module.body);
-    checker.walk(&module.body, root);
+    for statement in &module.body {
+        checker.visit_stmt(statement);
+    }
 
     let in_docs_path = in_docs(path);
+    let license_header = is_license_header(source);
+    let mut previous_divider = None;
     for token in parsed.tokens().iter() {
         if token.kind() != TokenKind::Comment {
             continue;
@@ -108,147 +156,129 @@ pub fn check_file(
         let range = token.range();
         let text = &source[range.start().to_usize()..range.end().to_usize()];
         let body = text.strip_prefix('#').unwrap_or(text).trim();
-        let line = line_at(source, range.start().to_usize());
+        let line = locator.location(range.start().to_usize()).0;
 
         if !in_docs_path {
             let lower = body.to_ascii_lowercase();
             let changelog = ["used to be", "formerly", "renamed", "originally"]
                 .iter()
                 .any(|phrase| lower.contains(phrase));
+            let divider = has_divider_run(body);
+            let report_divider = divider
+                && !(license_header && line <= 25)
+                && previous_divider.is_none_or(|previous| line > previous + 2);
+            if divider {
+                previous_divider = Some(line);
+            }
 
-            if changelog || has_divider_run(body) {
+            if changelog || report_divider {
                 let what = if changelog {
                     "changelog comment"
                 } else {
                     "decorative divider comment"
                 };
-                checker.flag("comment-noise", line, what);
+                checker.flag(Rule::CommentNoise, range, what);
             }
         }
 
         checker.scan_prose(body, line);
     }
 
-    let mut idents = IdentScan {
-        source,
-        path,
-        banned,
-        findings: Vec::new(),
-    };
-    for stmt in &module.body {
-        idents.visit_stmt(stmt);
-    }
-    checker.findings.extend(idents.findings);
+    let directives = noqa::directives(source, parsed.tokens(), &locator);
+    checker.findings.retain(|finding| {
+        finding.span.is_none_or(|span| {
+            directives
+                .get(&span.line)
+                .is_none_or(|directive| !directive.suppresses(finding.rule))
+        })
+    });
 
-    let mut nan = NanFillScan {
-        source,
-        path,
-        findings: Vec::new(),
-    };
-    for stmt in &module.body {
-        nan.visit_stmt(stmt);
-    }
-    checker.findings.extend(nan.findings);
-
-    FileResult {
+    Ok(FileResult {
         findings: checker.findings,
         func_sigs: checker.func_sigs,
         classes: checker.classes,
-    }
+        callers: checker.callers,
+        ambiguous_calls: checker.ambiguous_calls,
+        test_fns: checker.test_fns,
+        mock_calls: checker.mock_calls,
+        public_symbols: module_public_symbols(&module.body),
+    })
 }
 
 struct Checker<'a> {
-    source: &'a str,
     path: &'a Path,
     package_dirs: &'a HashSet<String>,
     banned: &'a [String],
+    locator: &'a SourceLocator<'a>,
+    imports: &'a HashMap<String, String>,
+    module_functions: &'a HashSet<String>,
+    postponed_annotations: bool,
+    cell: Option<usize>,
+    is_stub_file: bool,
+    is_test_file: bool,
+    config: &'a Config,
     findings: Vec<Finding>,
     func_sigs: Vec<FuncSig>,
     classes: Vec<ClassInfo>,
+    callers: HashMap<String, HashSet<String>>,
+    ambiguous_calls: HashSet<String>,
+    test_fns: usize,
+    mock_calls: usize,
+    enclosing_params: HashSet<String>,
+    in_interface: bool,
+    scope: Vec<String>,
+    local_scopes: Vec<LocalScope>,
+    direct_callee: bool,
+    reported_identifiers: HashSet<(usize, String)>,
 }
 
-impl Checker<'_> {
-    fn flag(&mut self, rule: &'static str, line: usize, what: &str) {
-        self.findings.push(Finding {
+impl<'a> Checker<'a> {
+    fn flag(&mut self, rule: Rule, range: ruff_text_size::TextRange, what: &str) {
+        self.findings.push(Finding::source(
             rule,
-            file: self.path.display().to_string(),
-            line: Some(line),
-            message: what.to_string(),
-        });
+            path_string(self.path),
+            self.locator
+                .span(range.start().to_usize(), range.end().to_usize()),
+            self.cell,
+            what,
+        ));
     }
 
-    fn walk(&mut self, body: &[Stmt], scope: Scope<'_>) {
-        for stmt in body {
-            self.visit(stmt, scope);
-        }
+    fn flag_line(&mut self, rule: Rule, line: usize, what: &str) {
+        self.findings.push(Finding::source(
+            rule,
+            path_string(self.path),
+            crate::finding::Span {
+                line,
+                column: 1,
+                end_line: line,
+                end_column: 1,
+            },
+            self.cell,
+            what,
+        ));
     }
 
-    fn visit(&mut self, stmt: &Stmt, scope: Scope<'_>) {
-        match stmt {
-            Stmt::FunctionDef(func) => {
-                self.check_stub(func, scope.in_interface);
-                self.check_doc_bloat(func);
-                self.check_doc_prose(&func.body);
-                if is_test_name(func.name.as_str()) {
-                    self.check_test_function(func);
-                }
-                let fn_params: HashSet<String> = all_param_names(&func.parameters)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                self.walk(
-                    &func.body,
-                    Scope {
-                        enclosing_params: &fn_params,
-                        in_interface: false,
-                    },
+    fn check_identifier(&mut self, name: &str, range: ruff_text_size::TextRange) {
+        let tokens = tokenize(name);
+        let word = self
+            .banned
+            .iter()
+            .find(|word| {
+                word.chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
+                    && tokens.iter().any(|token| token == *word)
+            })
+            .cloned();
+        let start = range.start().to_usize();
+        if let Some(word) = word {
+            if self.reported_identifiers.insert((start, name.to_string())) {
+                self.flag(
+                    Rule::BannedWord,
+                    range,
+                    &format!("slop term \"{word}\" in name `{name}`"),
                 );
             }
-            Stmt::ClassDef(class) => {
-                let info = class_info(class, self.source);
-                let in_interface = info.is_protocol;
-                self.classes.push(info);
-                self.check_doc_prose(&class.body);
-                self.walk(
-                    &class.body,
-                    Scope {
-                        enclosing_params: scope.enclosing_params,
-                        in_interface,
-                    },
-                );
-            }
-            Stmt::If(if_stmt) => {
-                self.check_silent_none(if_stmt, scope.enclosing_params);
-                self.walk(&if_stmt.body, scope);
-                for clause in &if_stmt.elif_else_clauses {
-                    self.walk(&clause.body, scope);
-                }
-            }
-            Stmt::For(for_stmt) => {
-                self.walk(&for_stmt.body, scope);
-                self.walk(&for_stmt.orelse, scope);
-            }
-            Stmt::While(while_stmt) => {
-                self.walk(&while_stmt.body, scope);
-                self.walk(&while_stmt.orelse, scope);
-            }
-            Stmt::With(with_stmt) => self.walk(&with_stmt.body, scope),
-            Stmt::Try(try_stmt) => {
-                self.check_fallback(try_stmt);
-                self.walk(&try_stmt.body, scope);
-                for handler in &try_stmt.handlers {
-                    let ExceptHandler::ExceptHandler(handler) = handler;
-                    self.walk(&handler.body, scope);
-                }
-                self.walk(&try_stmt.orelse, scope);
-                self.walk(&try_stmt.finalbody, scope);
-            }
-            Stmt::Match(match_stmt) => {
-                for case in &match_stmt.cases {
-                    self.walk(&case.body, scope);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -257,7 +287,7 @@ impl Checker<'_> {
 
         for handler in &try_stmt.handlers {
             let ExceptHandler::ExceptHandler(handler) = handler;
-            if contains_raise(&handler.body) {
+            if body_always_raises(&handler.body) {
                 continue;
             }
 
@@ -270,45 +300,84 @@ impl Checker<'_> {
                     .any(|name| handler_subst.assigns.contains(name));
 
             if falls_back {
-                let line = line_at(self.source, handler.range.start().to_usize());
                 self.flag(
-                    "guard-fallback",
-                    line,
+                    Rule::GuardFallback,
+                    handler.range,
                     "except falls back to an alternative instead of failing",
                 );
             }
         }
     }
 
-    fn check_silent_none(&mut self, if_stmt: &StmtIf, enclosing_params: &HashSet<String>) {
-        let Some(name) = is_none_test(&if_stmt.test) else {
+    fn check_silent_test(
+        &mut self,
+        test: &Expr,
+        body: &[Stmt],
+        enclosing_params: &HashSet<String>,
+        range: ruff_text_size::TextRange,
+    ) {
+        let Some(name) = is_none_test(test) else {
             return;
         };
-        let assigns_name = Subst::of(&if_stmt.body).assigns.contains(&name);
+        let assigns_name = Subst::of(body).assigns.contains(&name);
         if assigns_name && !enclosing_params.contains(&name) {
-            let line = line_at(self.source, if_stmt.range.start().to_usize());
             self.flag(
-                "guard-silent-default",
-                line,
+                Rule::GuardSilentDefault,
+                range,
                 &format!("`if {name} is None` defaults a value that should have been provided"),
             );
         }
     }
 
-    /// A concrete function whose entire body is `pass`, `...`, or a bare
-    /// `raise NotImplementedError` is scaffolding. Skipped: `@overload` and `@abstractmethod`
-    /// methods, `Protocol` members, and `raise NotImplementedError("reason")` with a message
-    /// (a real API boundary). A bodyless method in a plain class, or a non-abstract method in
-    /// an ABC, is not skipped: if you mean "abstract", use `@abstractmethod`.
+    fn check_god_function(&mut self, func: &StmtFunctionDef) {
+        let statement_count = statement_count(&func.body);
+        let depth = branch_depth(&func.body, 0);
+        if statement_count > self.config.max_function_statements
+            || depth > self.config.max_branch_depth
+        {
+            self.flag(
+                Rule::GodFunction,
+                func.range,
+                &format!(
+                    "function `{}` has {statement_count} statements and branch depth {depth} (limits {} and {})",
+                    func.name.as_str(),
+                    self.config.max_function_statements,
+                    self.config.max_branch_depth
+                ),
+            );
+        }
+    }
+
+    fn check_god_class(&mut self, class: &StmtClassDef) {
+        let methods = class
+            .body
+            .iter()
+            .filter(|statement| matches!(statement, Stmt::FunctionDef(_)))
+            .count();
+        if methods > self.config.max_class_methods {
+            self.flag(
+                Rule::GodClass,
+                class.range,
+                &format!(
+                    "class `{}` defines {methods} methods (limit {})",
+                    class.name.as_str(),
+                    self.config.max_class_methods
+                ),
+            );
+        }
+    }
+
     fn check_stub(&mut self, func: &StmtFunctionDef, in_interface: bool) {
-        if in_interface || has_stub_decorator(&func.decorator_list) {
+        if self.is_stub_file
+            || in_interface
+            || has_decorator(&func.decorator_list, self.imports, true)
+        {
             return;
         }
         if is_stub_body(&func.body) {
-            let line = line_at(self.source, func.range.start().to_usize());
             self.flag(
-                "stub",
-                line,
+                Rule::Stub,
+                func.range,
                 &format!(
                     "`{}` is a placeholder body, not an implementation",
                     func.name.as_str()
@@ -317,8 +386,6 @@ impl Checker<'_> {
         }
     }
 
-    /// A docstring longer than the code it documents, on a tiny function, with no
-    /// structured Parameters/Returns/Examples section, is padding.
     fn check_doc_bloat(&mut self, func: &StmtFunctionDef) {
         let Some(doc) = func.body.first() else {
             return;
@@ -326,12 +393,12 @@ impl Checker<'_> {
         if !is_docstring(doc) {
             return;
         }
-        let doc_lines = line_span(self.source, doc.range());
+        let doc_lines = line_span(self.locator, doc.range());
         let code = &func.body[1..];
         let code_lines = match (code.first(), code.last()) {
             (Some(first), Some(last)) => {
-                line_at(self.source, last.range().end().to_usize())
-                    - line_at(self.source, first.range().start().to_usize())
+                self.locator.location(last.range().end().to_usize()).0
+                    - self.locator.location(first.range().start().to_usize()).0
                     + 1
             }
             _ => 0,
@@ -347,14 +414,7 @@ impl Checker<'_> {
             && doc_lines > code_lines
             && !has_doc_section(text.value.to_str())
         {
-            let line = line_at(self.source, doc.range().start().to_usize());
-            self.flag(
-                "doc-bloat",
-                line,
-                &format!(
-                    "{doc_lines}-line docstring over {code_lines} lines of code, no Parameters/Returns section"
-                ),
-            );
+            self.flag(Rule::DocBloat, doc.range(), &format!("{doc_lines}-line docstring over {code_lines} lines of code, no Parameters/Returns section"));
         }
     }
 
@@ -369,7 +429,7 @@ impl Checker<'_> {
         let Expr::StringLiteral(text) = expr.value.as_ref() else {
             return;
         };
-        let line = line_at(self.source, stmt.range().start().to_usize());
+        let line = self.locator.location(stmt.range().start().to_usize()).0;
         self.scan_prose(text.value.to_str(), line);
     }
 
@@ -378,22 +438,27 @@ impl Checker<'_> {
         let banned = self.banned;
         for word in banned {
             if contains_word(&lower, word) {
-                self.flag("banned-word", line, &format!("slop term \"{word}\""));
+                self.flag_line(Rule::BannedWord, line, &format!("slop term \"{word}\""));
             }
         }
         if has_emoji(text) {
-            self.flag("banned-word", line, "emoji in prose");
+            self.flag_line(Rule::BannedWord, line, "emoji in prose");
         }
     }
 
     fn check_test_function(&mut self, func: &StmtFunctionDef) {
+        self.test_fns += 1;
+        let subject = TestSubject::new(self.path, func.name.as_str());
         let mut scan = TestScan {
             asserts: Vec::new(),
             has_raises: false,
             has_strong_assert: false,
-            mock_lines: Vec::new(),
-            source: self.source,
+            sut_mocks: Vec::new(),
+            mock_calls: 0,
             package_dirs: self.package_dirs,
+            imports: self.imports.clone(),
+            path: self.path,
+            subject,
         };
         for decorator in &func.decorator_list {
             scan.visit_expr(&decorator.expression);
@@ -402,44 +467,373 @@ impl Checker<'_> {
             scan.visit_stmt(stmt);
         }
 
-        for line in &scan.mock_lines {
+        self.mock_calls += scan.mock_calls;
+        for (range, target) in &scan.sut_mocks {
             self.flag(
-                "test-mock-sut",
-                *line,
-                "test mocks a first-party symbol it should exercise",
+                Rule::TestMockSut,
+                *range,
+                &format!("test replaces first-party subject `{target}`"),
             );
         }
 
-        if !scan.asserts.is_empty()
-            && !scan.has_raises
+        if !scan.has_raises
             && !scan.has_strong_assert
-            && scan.asserts.iter().all(|&test| is_weak_assert(test))
+            && (scan.asserts.is_empty() || scan.asserts.iter().all(|&test| is_weak_assert(test)))
         {
-            let line = line_at(self.source, func.range.start().to_usize());
+            let detail = if scan.asserts.is_empty() {
+                "has no behavioral observation"
+            } else {
+                "asserts only metadata or None"
+            };
             self.flag(
-                "test-weak",
-                line,
-                &format!(
-                    "test `{}` asserts only types/shapes/None, never a value",
-                    func.name.as_str()
-                ),
+                Rule::TestWeak,
+                func.range,
+                &format!("test `{}` {detail}", func.name.as_str()),
             );
+        }
+    }
+
+    fn check_comprehension(
+        &mut self,
+        generators: &'a [Comprehension],
+        value: impl FnOnce(&mut Self),
+    ) {
+        let Some((first, rest)) = generators.split_first() else {
+            return value(self);
+        };
+        self.visit_expr(&first.iter);
+        let mut bindings = HashSet::new();
+        generators
+            .iter()
+            .for_each(|generator| collect_targets(&generator.target, &mut bindings, false));
+        self.local_scopes
+            .push((false, HashMap::new(), bindings, HashSet::new()));
+        self.visit_expr(&first.target);
+        first
+            .ifs
+            .iter()
+            .for_each(|condition| self.visit_expr(condition));
+        for generator in rest {
+            self.visit_expr(&generator.iter);
+            self.visit_expr(&generator.target);
+            generator
+                .ifs
+                .iter()
+                .for_each(|condition| self.visit_expr(condition));
+        }
+        value(self);
+        self.local_scopes.pop();
+    }
+
+    fn mark_ambiguous(&mut self, callee: String) {
+        self.ambiguous_calls.insert(callee);
+    }
+
+    fn mark_reference_ambiguous(&mut self, raw: &str) {
+        let root = raw.split('.').next().unwrap_or(raw);
+        let mut targets = Vec::new();
+        for (index, scope) in self.local_scopes.iter().rev().enumerate() {
+            if scope.0 && index > 0 {
+                continue;
+            }
+            if let Some(imported) = scope.1.get(root) {
+                targets.extend([imported.clone(), resolve_name(raw, &scope.1)]);
+                break;
+            }
+            if scope.3.contains(root) {
+                break;
+            }
+            if scope.2.contains(root) {
+                if self.module_functions.contains(root) {
+                    targets.push(format!("{}.{}", module_name(self.path), root));
+                }
+                targets
+                    .into_iter()
+                    .for_each(|target| self.mark_ambiguous(target));
+                return;
+            }
+        }
+        if let Some(imported) = self.imports.get(root) {
+            targets.extend([imported.clone(), resolve_name(raw, self.imports)]);
+        } else if self.module_functions.contains(root) {
+            targets.push(format!("{}.{}", module_name(self.path), root));
+        }
+        targets
+            .into_iter()
+            .for_each(|target| self.mark_ambiguous(target));
+    }
+}
+
+impl<'a> Visitor<'a> for Checker<'a> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                self.check_identifier(function.name.as_str(), function.name.range);
+                for parameter in all_params(&function.parameters) {
+                    self.check_identifier(parameter.name.as_str(), parameter.name.range);
+                }
+                self.check_stub(function, self.in_interface);
+                self.check_doc_bloat(function);
+                self.check_god_function(function);
+                self.check_doc_prose(&function.body);
+                if self.is_test_file && is_test_name(function.name.as_str()) {
+                    self.check_test_function(function);
+                }
+                function
+                    .decorator_list
+                    .iter()
+                    .for_each(|decorator| self.visit_expr(&decorator.expression));
+                if let Some(type_params) = &function.type_params {
+                    self.visit_type_params(type_params);
+                }
+                self.visit_parameters(&function.parameters);
+                if let Some(returns) = &function.returns {
+                    self.visit_annotation(returns);
+                }
+                let outer = std::mem::replace(
+                    &mut self.enclosing_params,
+                    all_param_names(&function.parameters)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                );
+                let outer_interface = std::mem::take(&mut self.in_interface);
+                self.scope.push(function.name.as_str().to_string());
+                let (bindings, globals) = binding_names(&function.body, Some(&function.parameters));
+                self.local_scopes.push((
+                    false,
+                    import_map(&function.body, self.path),
+                    bindings,
+                    globals,
+                ));
+                function
+                    .body
+                    .iter()
+                    .for_each(|statement| self.visit_stmt(statement));
+                self.local_scopes.pop();
+                self.scope.pop();
+                self.in_interface = outer_interface;
+                self.enclosing_params = outer;
+                return;
+            }
+            Stmt::ClassDef(class) => {
+                self.check_identifier(class.name.as_str(), class.name.range);
+                let info = class_info(
+                    class,
+                    self.path,
+                    self.imports,
+                    self.locator,
+                    self.cell,
+                    &self.scope,
+                );
+                class
+                    .decorator_list
+                    .iter()
+                    .for_each(|decorator| self.visit_expr(&decorator.expression));
+                if let Some(type_params) = &class.type_params {
+                    self.visit_type_params(type_params);
+                }
+                if let Some(arguments) = &class.arguments {
+                    self.visit_arguments(arguments);
+                }
+                let outer = std::mem::replace(&mut self.in_interface, info.is_protocol);
+                self.scope.push(class.name.as_str().to_string());
+                let (bindings, globals) = binding_names(&class.body, None);
+                self.local_scopes.push((
+                    true,
+                    import_map(&class.body, self.path),
+                    bindings,
+                    globals,
+                ));
+                self.classes.push(info);
+                self.check_god_class(class);
+                self.check_doc_prose(&class.body);
+                class
+                    .body
+                    .iter()
+                    .for_each(|statement| self.visit_stmt(statement));
+                self.local_scopes.pop();
+                self.scope.pop();
+                self.in_interface = outer;
+                return;
+            }
+            Stmt::If(statement) => {
+                let params = std::mem::take(&mut self.enclosing_params);
+                self.check_silent_test(&statement.test, &statement.body, &params, statement.range);
+                for clause in &statement.elif_else_clauses {
+                    if let Some(test) = &clause.test {
+                        self.check_silent_test(test, &clause.body, &params, clause.range);
+                    }
+                }
+                self.enclosing_params = params;
+            }
+            Stmt::Try(statement) => self.check_fallback(statement),
+            _ => {}
+        }
+        walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        match expression {
+            Expr::Name(name) => {
+                self.check_identifier(name.id.as_str(), name.range);
+                if !self.direct_callee {
+                    self.mark_reference_ambiguous(name.id.as_str());
+                }
+            }
+            Expr::Attribute(attribute) => {
+                self.check_identifier(attribute.attr.as_str(), attribute.range);
+                if !self.direct_callee {
+                    if let Some(raw) = qualified_callee(expression) {
+                        self.mark_reference_ambiguous(&raw);
+                    }
+                }
+            }
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = &lambda.parameters {
+                    for parameter in all_params(parameters) {
+                        self.check_identifier(parameter.name.as_str(), parameter.name.range);
+                    }
+                    self.visit_parameters(parameters);
+                }
+                self.local_scopes.push((
+                    false,
+                    HashMap::new(),
+                    lambda_bindings(&lambda.body, lambda.parameters.as_deref()),
+                    HashSet::new(),
+                ));
+                self.visit_expr(&lambda.body);
+                self.local_scopes.pop();
+                return;
+            }
+            Expr::ListComp(comp) => {
+                self.check_comprehension(&comp.generators, |checker| checker.visit_expr(&comp.elt));
+                return;
+            }
+            Expr::SetComp(comp) => {
+                self.check_comprehension(&comp.generators, |checker| checker.visit_expr(&comp.elt));
+                return;
+            }
+            Expr::DictComp(comp) => {
+                self.check_comprehension(&comp.generators, |checker| {
+                    if let Some(key) = &comp.key {
+                        checker.visit_expr(key);
+                    }
+                    checker.visit_expr(&comp.value);
+                });
+                return;
+            }
+            Expr::Generator(comp) => {
+                self.check_comprehension(&comp.generators, |checker| checker.visit_expr(&comp.elt));
+                return;
+            }
+            Expr::Call(call) => {
+                if let Some(raw) = qualified_callee(&call.func) {
+                    let root = raw.split('.').next().unwrap_or(&raw);
+                    let mut local = None;
+                    let mut shadowed = false;
+                    let mut ambiguous = Vec::new();
+                    for (index, scope) in self.local_scopes.iter().rev().enumerate() {
+                        if scope.0 && index > 0 {
+                            continue;
+                        }
+                        if let Some(resolved) =
+                            scope.1.get(root).map(|_| resolve_name(&raw, &scope.1))
+                        {
+                            if scope.2.contains(root) {
+                                ambiguous.push(resolved);
+                                if self.module_functions.contains(root) {
+                                    ambiguous.push(format!("{}.{}", module_name(self.path), raw));
+                                }
+                            } else {
+                                local = Some(resolved);
+                            }
+                            break;
+                        }
+                        if scope.3.contains(root) {
+                            break;
+                        }
+                        if scope.2.contains(root) {
+                            if self.module_functions.contains(root) {
+                                ambiguous.push(format!("{}.{}", module_name(self.path), raw));
+                            } else {
+                                shadowed = true;
+                            }
+                            break;
+                        }
+                    }
+                    for callee in ambiguous.iter().cloned() {
+                        self.mark_ambiguous(callee);
+                    }
+                    if ambiguous.is_empty() && !shadowed {
+                        let resolved = local.unwrap_or_else(|| {
+                            if !raw.contains('.') && self.module_functions.contains(root) {
+                                format!("{}.{}", module_name(self.path), raw)
+                            } else {
+                                resolve_name(&raw, self.imports)
+                            }
+                        });
+                        let name = if resolved == raw && !raw.contains('.') {
+                            format!("{}.{}", module_name(self.path), raw)
+                        } else {
+                            resolved
+                        };
+                        let caller = format!("{}.{}", module_name(self.path), self.scope.join("."))
+                            .trim_end_matches('.')
+                            .to_string();
+                        self.callers.entry(name).or_default().insert(caller);
+                    }
+                }
+                if let Some(name @ ("nan_to_num" | "fillna")) = callee_name(&call.func) {
+                    self.flag(
+                        Rule::GuardSilentDefault,
+                        call.range,
+                        &format!("`{name}` silently replaces NaN or missing values"),
+                    );
+                }
+                self.direct_callee = matches!(call.func.as_ref(), Expr::Name(_));
+                self.visit_expr(&call.func);
+                self.direct_callee = false;
+                call.arguments
+                    .args
+                    .iter()
+                    .for_each(|argument| self.visit_expr(argument));
+                call.arguments
+                    .keywords
+                    .iter()
+                    .for_each(|keyword| self.visit_expr(&keyword.value));
+                return;
+            }
+            _ => {}
+        }
+        walk_expr(self, expression);
+    }
+
+    fn visit_annotation(&mut self, expression: &'a Expr) {
+        if !self.postponed_annotations {
+            self.visit_expr(expression);
         }
     }
 }
 
-/// Collects what a test function asserts and mocks, recursing through its body and decorators.
 struct TestScan<'a> {
     asserts: Vec<&'a Expr>,
     has_raises: bool,
     has_strong_assert: bool,
-    mock_lines: Vec<usize>,
-    source: &'a str,
+    sut_mocks: Vec<(ruff_text_size::TextRange, String)>,
+    mock_calls: usize,
     package_dirs: &'a HashSet<String>,
+    imports: HashMap<String, String>,
+    path: &'a Path,
+    subject: TestSubject,
 }
 
 impl<'a> Visitor<'a> for TestScan<'a> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            return;
+        }
+        update_imports(stmt, self.path, &mut self.imports);
         if let Stmt::Assert(assert) = stmt {
             self.asserts.push(&assert.test);
         }
@@ -448,119 +842,30 @@ impl<'a> Visitor<'a> for TestScan<'a> {
 
     fn visit_expr(&mut self, expr: &'a Expr) {
         if let Expr::Call(call) = expr {
-            if let Some(name) = callee_name(&call.func) {
-                if name == "raises" {
+            if let Some(path) = qualified_callee(&call.func) {
+                let resolved = resolve_name(&path, &self.imports);
+                if matches!(resolved.as_str(), "pytest.raises" | "pytest.warns") {
                     self.has_raises = true;
                 }
-                if is_strong_assert_call(name) {
+                let metadata = call.arguments.args.iter().any(expr_is_metadata)
+                    || call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .any(|arg| expr_is_metadata(&arg.value));
+                if is_strong_assert_call(&resolved, self.package_dirs) && !metadata {
                     self.has_strong_assert = true;
                 }
-                if matches!(name, "patch" | "setattr" | "setitem" | "object") {
-                    if let Some(root) = mock_target_root(call) {
-                        if self.package_dirs.contains(&root) {
-                            self.mock_lines
-                                .push(line_at(self.source, call.range.start().to_usize()));
+                if is_mock_call(&resolved) {
+                    self.mock_calls += 1;
+                    if let Some(target) = mock_target(call, &resolved, &self.imports) {
+                        let mut segments = target.split('.');
+                        let root = segments.next().unwrap_or("");
+                        let is_subject = self.subject.matches(&target);
+                        if self.package_dirs.contains(root) && is_subject {
+                            self.sut_mocks.push((call.range, target));
                         }
                     }
-                }
-            }
-        }
-        walk_expr(self, expr);
-    }
-}
-
-/// Scans every identifier in a module for banned tokens: function, class, parameter and
-/// lambda-parameter names, plus every `Name` and attribute occurrence (so for-targets,
-/// `with ... as`, comprehension variables and `self.attr` are all covered). Each name is
-/// tokenized on underscores and camelCase, matched whole-token, so `seamless` fires in
-/// `seamless_run` and `SeamlessRun` but not in `seamlessly`.
-struct IdentScan<'a> {
-    source: &'a str,
-    path: &'a Path,
-    banned: &'a [String],
-    findings: Vec<Finding>,
-}
-
-impl IdentScan<'_> {
-    fn check(&mut self, name: &str, line: usize) {
-        let tokens = tokenize(name);
-        let banned = self.banned;
-        for word in banned {
-            if tokens.iter().any(|token| token.as_str() == word.as_str()) {
-                self.findings.push(Finding {
-                    rule: "banned-word",
-                    file: self.path.display().to_string(),
-                    line: Some(line),
-                    message: format!("slop term \"{word}\" in name `{name}`"),
-                });
-            }
-        }
-    }
-}
-
-impl<'a> Visitor<'a> for IdentScan<'a> {
-    fn visit_stmt(&mut self, stmt: &'a Stmt) {
-        match stmt {
-            Stmt::FunctionDef(func) => {
-                let line = line_at(self.source, func.range.start().to_usize());
-                self.check(func.name.as_str(), line);
-                for name in all_param_names(&func.parameters) {
-                    self.check(name, line);
-                }
-            }
-            Stmt::ClassDef(class) => {
-                let line = line_at(self.source, class.range.start().to_usize());
-                self.check(class.name.as_str(), line);
-            }
-            _ => {}
-        }
-        walk_stmt(self, stmt);
-    }
-
-    fn visit_expr(&mut self, expr: &'a Expr) {
-        match expr {
-            Expr::Name(name) => {
-                let line = line_at(self.source, name.range.start().to_usize());
-                self.check(name.id.as_str(), line);
-            }
-            Expr::Attribute(attr) => {
-                let line = line_at(self.source, attr.range.start().to_usize());
-                self.check(attr.attr.as_str(), line);
-            }
-            Expr::Lambda(lambda) => {
-                if let Some(params) = &lambda.parameters {
-                    let line = line_at(self.source, lambda.range.start().to_usize());
-                    for name in all_param_names(params) {
-                        self.check(name, line);
-                    }
-                }
-            }
-            _ => {}
-        }
-        walk_expr(self, expr);
-    }
-}
-
-/// Flags `nan_to_num` / `fillna` calls anywhere they appear — they silently replace
-/// missing or NaN values instead of failing.
-struct NanFillScan<'a> {
-    source: &'a str,
-    path: &'a Path,
-    findings: Vec<Finding>,
-}
-
-impl<'a> Visitor<'a> for NanFillScan<'a> {
-    fn visit_expr(&mut self, expr: &'a Expr) {
-        if let Expr::Call(call) = expr {
-            if let Some(name) = callee_name(&call.func) {
-                if name == "nan_to_num" || name == "fillna" {
-                    let line = line_at(self.source, call.range.start().to_usize());
-                    self.findings.push(Finding {
-                        rule: "guard-silent-default",
-                        file: self.path.display().to_string(),
-                        line: Some(line),
-                        message: format!("`{name}` silently replaces NaN or missing values"),
-                    });
                 }
             }
         }
@@ -581,71 +886,308 @@ impl Subst {
             returns: false,
             assigns: HashSet::new(),
         };
-        for stmt in body {
-            match stmt {
-                Stmt::Import(_) | Stmt::ImportFrom(_) => subst.imports = true,
-                Stmt::Return(_) => subst.returns = true,
-                Stmt::Assign(assign) => {
-                    for target in &assign.targets {
-                        if let Expr::Name(name) = target {
-                            subst.assigns.insert(name.id.as_str().to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
+        for statement in body {
+            subst.collect(statement);
         }
         subst
     }
-}
 
-fn contains_raise(body: &[Stmt]) -> bool {
-    struct RaiseFinder {
-        found: bool,
-    }
-    impl<'a> Visitor<'a> for RaiseFinder {
-        fn visit_stmt(&mut self, stmt: &'a Stmt) {
-            if matches!(stmt, Stmt::Raise(_)) {
-                self.found = true;
+    fn collect(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::FunctionDef(function) => {
+                self.assigns.extend([function.name.as_str().to_string()])
             }
-            walk_stmt(self, stmt);
+            Stmt::ClassDef(class) => self.assigns.extend([class.name.as_str().to_string()]),
+            Stmt::Import(_) | Stmt::ImportFrom(_) => self.imports = true,
+            Stmt::Return(_) => self.returns = true,
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    collect_targets(target, &mut self.assigns, true);
+                }
+            }
+            Stmt::AnnAssign(assign) => collect_targets(&assign.target, &mut self.assigns, true),
+            Stmt::AugAssign(assign) => collect_targets(&assign.target, &mut self.assigns, true),
+            Stmt::If(statement) => {
+                self.collect_body(&statement.body);
+                for clause in &statement.elif_else_clauses {
+                    self.collect_body(&clause.body);
+                }
+            }
+            Stmt::For(statement) => {
+                collect_targets(&statement.target, &mut self.assigns, true);
+                self.collect_body(&statement.body);
+                self.collect_body(&statement.orelse);
+            }
+            Stmt::While(statement) => {
+                self.collect_body(&statement.body);
+                self.collect_body(&statement.orelse);
+            }
+            Stmt::With(statement) => self.collect_body(&statement.body),
+            Stmt::Try(statement) => {
+                self.collect_body(&statement.body);
+                for handler in &statement.handlers {
+                    let ExceptHandler::ExceptHandler(handler) = handler;
+                    self.collect_body(&handler.body);
+                }
+                self.collect_body(&statement.orelse);
+                self.collect_body(&statement.finalbody);
+            }
+            Stmt::Match(statement) => {
+                for case in &statement.cases {
+                    self.collect_body(&case.body);
+                }
+            }
+            _ => {}
         }
     }
-    let mut finder = RaiseFinder { found: false };
-    for stmt in body {
-        finder.visit_stmt(stmt);
+
+    fn collect_body(&mut self, body: &[Stmt]) {
+        for statement in body {
+            self.collect(statement);
+        }
     }
-    finder.found
+}
+
+fn binding_names(
+    body: &[Stmt],
+    parameters: Option<&Parameters>,
+) -> (HashSet<String>, HashSet<String>) {
+    #[derive(Default)]
+    struct Scan(HashSet<String>, HashSet<String>, HashSet<String>);
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::FunctionDef(function) => {
+                    self.0.insert(function.name.as_str().to_string());
+                    function
+                        .decorator_list
+                        .iter()
+                        .for_each(|decorator| self.visit_expr(&decorator.expression));
+                    if let Some(type_params) = &function.type_params {
+                        self.visit_type_params(type_params);
+                    }
+                    self.visit_parameters(&function.parameters);
+                    if let Some(returns) = &function.returns {
+                        self.visit_expr(returns);
+                    }
+                    return;
+                }
+                Stmt::ClassDef(class) => {
+                    self.0.insert(class.name.as_str().to_string());
+                    class
+                        .decorator_list
+                        .iter()
+                        .for_each(|decorator| self.visit_expr(&decorator.expression));
+                    if let Some(type_params) = &class.type_params {
+                        self.visit_type_params(type_params);
+                    }
+                    if let Some(arguments) = &class.arguments {
+                        self.visit_arguments(arguments);
+                    }
+                    return;
+                }
+                Stmt::Assign(assign) => assign
+                    .targets
+                    .iter()
+                    .for_each(|target| collect_targets(target, &mut self.0, false)),
+                Stmt::AnnAssign(assign) => collect_targets(&assign.target, &mut self.0, false),
+                Stmt::AugAssign(assign) => collect_targets(&assign.target, &mut self.0, false),
+                Stmt::For(statement) => collect_targets(&statement.target, &mut self.0, false),
+                Stmt::Delete(statement) => statement
+                    .targets
+                    .iter()
+                    .for_each(|target| collect_targets(target, &mut self.0, false)),
+                Stmt::TypeAlias(statement) => collect_targets(&statement.name, &mut self.0, false),
+                Stmt::Global(statement) => self
+                    .1
+                    .extend(statement.names.iter().map(|name| name.as_str().to_string())),
+                Stmt::Nonlocal(statement) => self
+                    .2
+                    .extend(statement.names.iter().map(|name| name.as_str().to_string())),
+                Stmt::Import(import) => import.names.iter().for_each(|alias| {
+                    let name = alias
+                        .asname
+                        .as_ref()
+                        .map(|name| name.as_str())
+                        .unwrap_or_else(|| alias.name.as_str().split('.').next().unwrap());
+                    self.0.insert(name.to_string());
+                }),
+                Stmt::ImportFrom(import) => import
+                    .names
+                    .iter()
+                    .filter(|alias| alias.name.as_str() != "*")
+                    .for_each(|alias| {
+                        self.0.insert(
+                            alias
+                                .asname
+                                .as_ref()
+                                .map(|name| name.as_str())
+                                .unwrap_or_else(|| alias.name.as_str())
+                                .to_string(),
+                        );
+                    }),
+                _ => {}
+            }
+            walk_stmt(self, statement);
+        }
+        fn visit_expr(&mut self, expression: &'a Expr) {
+            match expression {
+                Expr::Named(named) => collect_targets(&named.target, &mut self.0, false),
+                Expr::Lambda(lambda) => {
+                    if let Some(parameters) = &lambda.parameters {
+                        self.visit_parameters(parameters);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            walk_expr(self, expression);
+        }
+        fn visit_except_handler(&mut self, handler: &'a ExceptHandler) {
+            let ExceptHandler::ExceptHandler(node) = handler;
+            self.0
+                .extend(node.name.iter().map(|name| name.as_str().to_string()));
+            walk_except_handler(self, handler);
+        }
+        fn visit_with_item(&mut self, item: &'a WithItem) {
+            if let Some(target) = &item.optional_vars {
+                collect_targets(target, &mut self.0, false);
+            }
+            walk_with_item(self, item);
+        }
+        fn visit_pattern(&mut self, pattern: &'a Pattern) {
+            match pattern {
+                Pattern::MatchMapping(node) => self
+                    .0
+                    .extend(node.rest.iter().map(|name| name.as_str().to_string())),
+                Pattern::MatchStar(node) => self
+                    .0
+                    .extend(node.name.iter().map(|name| name.as_str().to_string())),
+                Pattern::MatchAs(node) => self
+                    .0
+                    .extend(node.name.iter().map(|name| name.as_str().to_string())),
+                _ => {}
+            }
+            walk_pattern(self, pattern);
+        }
+    }
+    let mut scan = Scan::default();
+    scan.0.extend(
+        parameters
+            .into_iter()
+            .flat_map(all_param_names)
+            .map(str::to_string),
+    );
+    body.iter().for_each(|statement| scan.visit_stmt(statement));
+    scan.1.retain(|name| !scan.0.contains(name));
+    scan.0.retain(|name| !scan.2.contains(name));
+    (scan.0, scan.1)
+}
+
+fn lambda_bindings(body: &Expr, parameters: Option<&Parameters>) -> HashSet<String> {
+    #[derive(Default)]
+    struct Scan(HashSet<String>);
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_expr(&mut self, expression: &'a Expr) {
+            match expression {
+                Expr::Named(named) => collect_targets(&named.target, &mut self.0, false),
+                Expr::Lambda(_) => return,
+                _ => {}
+            }
+            walk_expr(self, expression);
+        }
+    }
+    let mut scan = Scan::default();
+    scan.0.extend(
+        parameters
+            .into_iter()
+            .flat_map(all_param_names)
+            .map(str::to_string),
+    );
+    scan.visit_expr(body);
+    scan.0
+}
+
+fn body_always_raises(body: &[Stmt]) -> bool {
+    body.iter().any(statement_always_raises)
+}
+
+fn statement_always_raises(statement: &Stmt) -> bool {
+    match statement {
+        Stmt::Raise(_) => true,
+        Stmt::If(statement) => {
+            !statement.elif_else_clauses.is_empty()
+                && statement
+                    .elif_else_clauses
+                    .last()
+                    .is_some_and(|clause| clause.test.is_none())
+                && body_always_raises(&statement.body)
+                && statement
+                    .elif_else_clauses
+                    .iter()
+                    .all(|clause| body_always_raises(&clause.body))
+        }
+        _ => false,
+    }
+}
+
+fn collect_targets(expression: &Expr, names: &mut HashSet<String>, qualified: bool) {
+    match expression {
+        Expr::Name(name) => {
+            names.insert(name.id.as_str().to_string());
+        }
+        Expr::Attribute(_) if qualified => names.extend(qualified_callee(expression)),
+        Expr::Subscript(subscript) if qualified => collect_targets(&subscript.value, names, true),
+        Expr::Tuple(tuple) => tuple
+            .elts
+            .iter()
+            .for_each(|item| collect_targets(item, names, qualified)),
+        Expr::List(list) => list
+            .elts
+            .iter()
+            .for_each(|item| collect_targets(item, names, qualified)),
+        Expr::Starred(starred) => collect_targets(&starred.value, names, qualified),
+        _ => (),
+    }
 }
 
 fn all_param_names(params: &Parameters) -> Vec<&str> {
-    let mut names: Vec<&str> = params
+    all_params(params)
+        .into_iter()
+        .map(|parameter| parameter.name.as_str())
+        .collect()
+}
+
+fn all_params(params: &Parameters) -> Vec<&Parameter> {
+    let mut parameters: Vec<&Parameter> = params
         .posonlyargs
         .iter()
         .chain(&params.args)
         .chain(&params.kwonlyargs)
-        .map(|param| param.parameter.name.as_str())
+        .map(|parameter| &parameter.parameter)
         .collect();
     if let Some(vararg) = &params.vararg {
-        names.push(vararg.name.as_str());
+        parameters.push(vararg);
     }
     if let Some(kwarg) = &params.kwarg {
-        names.push(kwarg.name.as_str());
+        parameters.push(kwarg);
     }
-    names
+    parameters
 }
 
-/// `<name> is None` -> Some(name); used to spot the silent-default pattern.
 fn is_none_test(test: &Expr) -> Option<String> {
     let Expr::Compare(cmp) = test else {
         return None;
     };
-    if cmp.ops.len() == 1
-        && matches!(cmp.ops[0], CmpOp::Is)
-        && cmp.comparators.len() == 1
-        && matches!(cmp.comparators[0], Expr::NoneLiteral(_))
-    {
+    if cmp.ops.len() != 1 || !matches!(cmp.ops[0], CmpOp::Is) || cmp.comparators.len() != 1 {
+        return None;
+    }
+    if matches!(cmp.comparators[0], Expr::NoneLiteral(_)) {
         if let Expr::Name(name) = cmp.left.as_ref() {
+            return Some(name.id.as_str().to_string());
+        }
+    } else if matches!(cmp.left.as_ref(), Expr::NoneLiteral(_)) {
+        if let Expr::Name(name) = &cmp.comparators[0] {
             return Some(name.id.as_str().to_string());
         }
     }
@@ -660,23 +1202,224 @@ fn callee_name(func: &Expr) -> Option<&str> {
     }
 }
 
-fn mock_target_root(call: &ExprCall) -> Option<String> {
-    let first = call.arguments.args.first()?;
-    match first {
-        Expr::StringLiteral(string) => string.value.to_str().split('.').next().map(str::to_string),
+fn qualified_callee(expression: &Expr) -> Option<String> {
+    match expression {
         Expr::Name(name) => Some(name.id.as_str().to_string()),
-        Expr::Attribute(_) => {
-            let mut current = first;
-            while let Expr::Attribute(attr) = current {
-                current = attr.value.as_ref();
-            }
-            if let Expr::Name(name) = current {
-                Some(name.id.as_str().to_string())
-            } else {
-                None
-            }
+        Expr::Attribute(attribute) => {
+            let prefix = qualified_callee(&attribute.value)?;
+            Some(format!("{prefix}.{}", attribute.attr.as_str()))
         }
         _ => None,
+    }
+}
+
+fn import_map(body: &[Stmt], path: &Path) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    for statement in body {
+        update_imports(statement, path, &mut imports);
+    }
+    imports
+}
+
+fn unshadowed_functions(body: &[Stmt]) -> HashSet<String> {
+    let mut functions = HashSet::new();
+    let mut conflicts = HashSet::new();
+    for statement in body {
+        let (mut bindings, _) = binding_names(std::slice::from_ref(statement), None);
+        if let Stmt::FunctionDef(function) = statement {
+            if !functions.insert(function.name.as_str().to_string()) {
+                conflicts.insert(function.name.as_str().to_string());
+            }
+            bindings.remove(function.name.as_str());
+        }
+        conflicts.extend(bindings);
+    }
+    functions.retain(|name| !conflicts.contains(name) && !has_star_import(body));
+    functions
+}
+
+fn has_star_import(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct Scan(bool);
+    impl<'a> Visitor<'a> for Scan {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            self.0 |= matches!(statement, Stmt::ImportFrom(import) if import.names.iter().any(|alias| alias.name.as_str() == "*"));
+            walk_stmt(self, statement);
+        }
+    }
+    let mut scan = Scan::default();
+    body.iter().for_each(|statement| scan.visit_stmt(statement));
+    scan.0
+}
+
+fn update_imports(statement: &Stmt, path: &Path, imports: &mut HashMap<String, String>) {
+    match statement {
+        Stmt::Import(import) => {
+            for alias in &import.names {
+                let full = alias.name.as_str();
+                if let Some(local) = &alias.asname {
+                    imports.insert(local.as_str().to_string(), full.to_string());
+                } else {
+                    let root = full.split('.').next().unwrap_or(full);
+                    imports.insert(root.to_string(), root.to_string());
+                }
+            }
+        }
+        Stmt::ImportFrom(import) => {
+            let module = import
+                .module
+                .as_ref()
+                .map(|name| name.as_str())
+                .unwrap_or("");
+            let module = if import.level > 0 {
+                relative_module(path, import.level, module)
+            } else {
+                module.to_string()
+            };
+            for alias in &import.names {
+                if alias.name.as_str() == "*" {
+                    continue;
+                }
+                let local = alias
+                    .asname
+                    .as_ref()
+                    .map(|name| name.as_str())
+                    .unwrap_or_else(|| alias.name.as_str());
+                let full = if module.is_empty() {
+                    alias.name.as_str().to_string()
+                } else {
+                    format!("{module}.{}", alias.name.as_str())
+                };
+                imports.insert(local.to_string(), full);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolve_name(path: &str, imports: &HashMap<String, String>) -> String {
+    let mut parts = path.splitn(2, '.');
+    let root = parts.next().unwrap_or(path);
+    let Some(resolved) = imports.get(root) else {
+        return path.to_string();
+    };
+    match parts.next() {
+        Some(rest) => format!("{resolved}.{rest}"),
+        None => resolved.clone(),
+    }
+}
+
+fn is_mock_call(path: &str) -> bool {
+    if let Some(method) = path
+        .strip_prefix("unittest.mock.")
+        .or_else(|| path.strip_prefix("mock."))
+        .or_else(|| path.strip_prefix("mocker."))
+    {
+        return matches!(
+            method,
+            "AsyncMock"
+                | "MagicMock"
+                | "Mock"
+                | "NonCallableMagicMock"
+                | "NonCallableMock"
+                | "PropertyMock"
+                | "create_autospec"
+                | "mock_open"
+                | "patch"
+                | "patch.dict"
+                | "patch.multiple"
+                | "patch.object"
+                | "spy"
+                | "stub"
+                | "async_stub"
+        );
+    }
+    matches!(
+        path,
+        "monkeypatch.setattr"
+            | "monkeypatch.setitem"
+            | "monkeypatch.delattr"
+            | "monkeypatch.delitem"
+            | "monkeypatch.setenv"
+            | "monkeypatch.delenv"
+    )
+}
+
+fn mock_target(call: &ExprCall, callee: &str, imports: &HashMap<String, String>) -> Option<String> {
+    let first = call.arguments.args.first()?;
+    let target = match first {
+        Expr::StringLiteral(string) => string.value.to_str().to_string(),
+        expression => qualified_callee(expression)?,
+    };
+    let mut resolved = resolve_name(&target, imports);
+    if (callee.ends_with("setattr") || callee.ends_with("delattr"))
+        && call.arguments.args.len() >= 2
+    {
+        if let Expr::StringLiteral(attribute) = &call.arguments.args[1] {
+            resolved.push('.');
+            resolved.push_str(attribute.value.to_str());
+        }
+    }
+    Some(resolved)
+}
+
+struct TestSubject {
+    module_suffix: Vec<String>,
+    file_tokens: HashSet<String>,
+    function_tokens: HashSet<String>,
+}
+
+impl TestSubject {
+    fn new(path: &Path, function_name: &str) -> Self {
+        let file = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let file_token_list: Vec<String> = tokenize(file)
+            .into_iter()
+            .filter(|token| !matches!(token.as_str(), "test" | "tests"))
+            .collect();
+        let file_tokens = file_token_list.iter().cloned().collect();
+        let module_suffix = file_token_list;
+        let function_tokens = tokenize(function_name)
+            .into_iter()
+            .filter(|token| !matches!(token.as_str(), "test" | "tests" | "when" | "should"))
+            .collect();
+        Self {
+            module_suffix,
+            file_tokens,
+            function_tokens,
+        }
+    }
+
+    fn matches(&self, target: &str) -> bool {
+        let segments: Vec<&str> = target.split('.').collect();
+        let Some(leaf) = segments.last() else {
+            return false;
+        };
+        let leaf_tokens: HashSet<String> = tokenize(leaf).into_iter().collect();
+        let full_tokens: Vec<String> = segments
+            .iter()
+            .flat_map(|segment| tokenize(segment))
+            .collect();
+        let parent_tokens: Vec<String> = segments[..segments.len() - 1]
+            .iter()
+            .flat_map(|segment| tokenize(segment))
+            .collect();
+        let module_matches = full_tokens.ends_with(&self.module_suffix)
+            || parent_tokens.ends_with(&self.module_suffix);
+        let leaf_matches_function = leaf_tokens
+            .iter()
+            .any(|token| self.function_tokens.contains(token));
+        let leaf_matches_file = !self.file_tokens.is_empty()
+            && self
+                .file_tokens
+                .iter()
+                .all(|token| leaf_tokens.contains(token));
+        module_matches && (leaf_matches_function || leaf_matches_file)
     }
 }
 
@@ -692,36 +1435,52 @@ fn is_weak_assert(test: &Expr) -> bool {
                     .ops
                     .iter()
                     .all(|op| matches!(op, CmpOp::Is | CmpOp::IsNot));
-            against_none || expr_is_shape_or_len(&cmp.left)
+            against_none
+                || expr_is_metadata(&cmp.left)
+                || cmp.comparators.iter().any(expr_is_metadata)
         }
         _ => false,
     }
 }
 
-/// A value-checking assertion call (`np.testing.assert_allclose`, `chex.assert_trees_all_close`,
-/// `torch.testing.assert_close`, `self.assertEqual`, ...). The type/None/instance variants do
-/// not count, since they pin no value.
-fn is_strong_assert_call(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("assert")
-        && !matches!(
-            name,
-            "assertIsInstance"
-                | "assertNotIsInstance"
-                | "assertIsNone"
-                | "assertIsNotNone"
-                | "assert_type"
-        )
+fn is_strong_assert_call(name: &str, package_roots: &HashSet<String>) -> bool {
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    let weak = matches!(
+        leaf.to_ascii_lowercase().as_str(),
+        "assertisinstance"
+            | "assertnotisinstance"
+            | "assertisnone"
+            | "assertisnotnone"
+            | "assert_type"
+    );
+    if weak || !leaf.to_ascii_lowercase().starts_with("assert") {
+        return false;
+    }
+    let root = name.split('.').next().unwrap_or(name);
+    let assertion_module = name
+        .split('.')
+        .any(|part| matches!(part, "asserts" | "testing" | "test_utils"));
+    name.starts_with("self.assert")
+        || name.contains(".testing.assert")
+        || name.starts_with("chex.assert")
+        || (package_roots.contains(root) && assertion_module)
+        || !name.contains('.')
 }
 
-fn expr_is_shape_or_len(expr: &Expr) -> bool {
+fn expr_is_metadata(expr: &Expr) -> bool {
     match expr {
-        Expr::Attribute(attr) => attr.attr.as_str() == "shape",
-        Expr::Call(call) => matches!(callee_name(&call.func), Some("len")),
+        Expr::Attribute(attr) => {
+            matches!(
+                attr.attr.as_str(),
+                "device" | "dtype" | "ndim" | "shape" | "size"
+            ) || expr_is_metadata(&attr.value)
+        }
+        Expr::Subscript(subscript) => expr_is_metadata(&subscript.value),
+        Expr::Call(call) => matches!(callee_name(&call.func), Some("len" | "size" | "dim")),
         _ => false,
     }
 }
 
-/// True when `stmt` is a string-literal expression standing alone, i.e. a docstring.
 fn is_docstring(stmt: &Stmt) -> bool {
     matches!(stmt, Stmt::Expr(e) if matches!(e.value.as_ref(), Expr::StringLiteral(_)))
 }
@@ -755,99 +1514,257 @@ fn is_bare_notimplemented(raise: &StmtRaise) -> bool {
     }
 }
 
-fn has_stub_decorator(decorators: &[Decorator]) -> bool {
+fn has_decorator(
+    decorators: &[Decorator],
+    imports: &HashMap<String, String>,
+    overload: bool,
+) -> bool {
     decorators.iter().any(|d| {
+        let name = qualified_callee(&d.expression).map(|name| resolve_name(&name, imports));
+        let leaf = name.as_deref().and_then(|name| name.rsplit('.').next());
         matches!(
-            decorator_name(&d.expression),
-            Some(
-                "overload"
-                    | "abstractmethod"
-                    | "abstractproperty"
-                    | "abstractclassmethod"
-                    | "abstractstaticmethod"
-            )
-        )
-    })
-}
-
-fn has_abstractmethod(decorators: &[Decorator]) -> bool {
-    decorators.iter().any(|d| {
-        matches!(
-            decorator_name(&d.expression),
+            leaf,
             Some(
                 "abstractmethod"
                     | "abstractproperty"
                     | "abstractclassmethod"
                     | "abstractstaticmethod"
             )
-        )
+        ) || (overload && leaf == Some("overload"))
     })
 }
 
-fn decorator_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Call(call) => callee_name(&call.func),
-        other => callee_name(other),
-    }
-}
-
-fn class_info(class: &StmtClassDef, source: &str) -> ClassInfo {
+fn class_info(
+    class: &StmtClassDef,
+    path: &Path,
+    imports: &HashMap<String, String>,
+    locator: &SourceLocator,
+    cell: Option<usize>,
+    scope: &[String],
+) -> ClassInfo {
     let mut bases = Vec::new();
-    let mut abstract_base = false;
     let mut protocol_base = false;
-    let mut abc_meta = false;
+    let module = module_name(path);
+    let prefix = if scope.is_empty() {
+        module
+    } else {
+        format!("{module}.{}", scope.join("."))
+    };
 
     if let Some(arguments) = &class.arguments {
         for base in arguments.args.iter() {
-            if let Some(name) = head_name(base) {
-                if name == "Protocol" {
+            if let Some(raw_name) = base_name(base) {
+                let mut name = resolve_name(&raw_name, imports);
+                if !name.contains('.') && !matches!(name.as_str(), "ABC" | "Protocol") {
+                    name = format!("{prefix}.{name}");
+                }
+                let leaf = name.rsplit('.').next().unwrap_or(&name);
+                if leaf == "Protocol" {
                     protocol_base = true;
-                    abstract_base = true;
-                } else if name == "ABC" {
-                    abstract_base = true;
                 }
                 bases.push(name);
             }
         }
-        for keyword in arguments.keywords.iter() {
-            if keyword
-                .arg
-                .as_ref()
-                .is_some_and(|a| a.as_str() == "metaclass")
-                && head_name(&keyword.value).as_deref() == Some("ABCMeta")
-            {
-                abc_meta = true;
-            }
-        }
     }
 
-    let has_abstract_method = class.body.iter().any(|stmt| match stmt {
-        Stmt::FunctionDef(func) => has_abstractmethod(&func.decorator_list),
-        _ => false,
-    });
-
+    let mut abstract_methods = Vec::new();
+    let mut concrete_methods = Vec::new();
+    for statement in &class.body {
+        let Stmt::FunctionDef(function) = statement else {
+            continue;
+        };
+        if has_decorator(&function.decorator_list, imports, false)
+            || (protocol_base && is_stub_body(&function.body))
+        {
+            abstract_methods.push(function.name.as_str().to_string());
+        } else {
+            concrete_methods.push(function.name.as_str().to_string());
+        }
+    }
     ClassInfo {
         name: class.name.as_str().to_string(),
+        qualified_name: format!("{prefix}.{}", class.name.as_str()),
         bases,
-        is_abstract: abstract_base || abc_meta || has_abstract_method,
+        is_abstract: protocol_base || !abstract_methods.is_empty(),
         is_protocol: protocol_base,
-        line: line_at(source, class.range.start().to_usize()),
+        abstract_methods,
+        concrete_methods,
+        line: locator.location(class.range.start().to_usize()).0,
+        cell,
     }
 }
 
-/// The leading name of a base-class expression: `Name` -> itself, `pkg.Base` -> `Base`,
-/// `Generic[T]` -> `Generic`.
-fn head_name(expr: &Expr) -> Option<String> {
+fn base_name(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Name(name) => Some(name.id.as_str().to_string()),
-        Expr::Attribute(attr) => Some(attr.attr.as_str().to_string()),
-        Expr::Subscript(sub) => head_name(&sub.value),
+        Expr::Name(_) | Expr::Attribute(_) => qualified_callee(expr),
+        Expr::Subscript(sub) => base_name(&sub.value),
         _ => None,
     }
 }
 
-/// A structured docstring section (numpy or Google style) marks real API documentation,
-/// which is never doc-bloat however long it is.
+fn module_name(path: &Path) -> String {
+    let mut parts: Vec<String> = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(str::to_string))
+        .collect();
+    let container = ["src", "python", "lib"]
+        .into_iter()
+        .find_map(|name| parts.iter().position(|part| part == name));
+    if let Some(container) = container {
+        parts.drain(..=container);
+    }
+    if let Some(last) = parts.last_mut() {
+        *last = Path::new(last)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(last)
+            .to_string();
+    }
+    if parts.last().is_some_and(|part| part == "__init__") {
+        parts.pop();
+    }
+    if parts.is_empty() {
+        "__root__".to_string()
+    } else {
+        parts.join(".")
+    }
+}
+
+fn relative_module(path: &Path, level: u32, imported: &str) -> String {
+    let module = module_name(path);
+    let is_package = path.file_stem().and_then(|value| value.to_str()) == Some("__init__");
+    let mut parts: Vec<&str> = module.split('.').collect();
+    if !is_package {
+        parts.pop();
+    }
+    for _ in 1..level {
+        parts.pop();
+    }
+    if !imported.is_empty() {
+        parts.push(imported);
+    }
+    parts.join(".")
+}
+
+fn module_public_symbols(body: &[Stmt]) -> Option<usize> {
+    let mut symbols = HashSet::new();
+    let mut explicit = None;
+    let mut unknown_exports = false;
+    for statement in body {
+        match statement {
+            Stmt::FunctionDef(function) if !function.name.as_str().starts_with('_') => {
+                symbols.insert(function.name.as_str().to_string());
+            }
+            Stmt::ClassDef(class) if !class.name.as_str().starts_with('_') => {
+                symbols.insert(class.name.as_str().to_string());
+            }
+            Stmt::Assign(assignment) => {
+                if assignment.targets.iter().any(is_dunder_all) {
+                    explicit = Some(static_string_set(&assignment.value)?);
+                    continue;
+                }
+                for target in &assignment.targets {
+                    let mut names = HashSet::new();
+                    collect_targets(target, &mut names, false);
+                    symbols.extend(names.into_iter().filter(|name| !name.starts_with('_')));
+                }
+            }
+            Stmt::AnnAssign(assignment) => {
+                if is_dunder_all(&assignment.target) {
+                    explicit = Some(static_string_set(assignment.value.as_deref()?)?);
+                    continue;
+                }
+                let mut names = HashSet::new();
+                collect_targets(&assignment.target, &mut names, false);
+                symbols.extend(names.into_iter().filter(|name| !name.starts_with('_')));
+            }
+            Stmt::AugAssign(assignment) if is_dunder_all(&assignment.target) => {
+                let additions = static_string_set(&assignment.value)?;
+                explicit.as_mut()?.extend(additions);
+            }
+            Stmt::Expr(statement) => {
+                let Expr::Call(call) = statement.value.as_ref() else {
+                    continue;
+                };
+                let Expr::Attribute(method) = call.func.as_ref() else {
+                    continue;
+                };
+                if is_dunder_all(&method.value) {
+                    return None;
+                }
+            }
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let local = alias.asname.as_ref().map_or_else(
+                        || {
+                            alias
+                                .name
+                                .as_str()
+                                .split('.')
+                                .next()
+                                .unwrap_or(alias.name.as_str())
+                        },
+                        |name| name.as_str(),
+                    );
+                    if !local.starts_with('_') {
+                        symbols.insert(local.to_string());
+                    }
+                }
+            }
+            Stmt::ImportFrom(import) => {
+                if import
+                    .module
+                    .as_ref()
+                    .is_some_and(|name| name == "__future__")
+                {
+                    continue;
+                }
+                for alias in &import.names {
+                    if alias.name.as_str() == "*" {
+                        unknown_exports = true;
+                        continue;
+                    }
+                    let local = alias
+                        .asname
+                        .as_ref()
+                        .map_or_else(|| alias.name.as_str(), |name| name.as_str());
+                    if !local.starts_with('_') {
+                        symbols.insert(local.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(explicit) = explicit {
+        Some(explicit.len())
+    } else if unknown_exports {
+        None
+    } else {
+        Some(symbols.len())
+    }
+}
+
+fn is_dunder_all(expression: &Expr) -> bool {
+    matches!(expression, Expr::Name(name) if name.id.as_str() == "__all__")
+}
+
+fn static_string_set(expression: &Expr) -> Option<HashSet<String>> {
+    let elements = match expression {
+        Expr::List(list) => list.elts.as_slice(),
+        Expr::Tuple(tuple) => tuple.elts.as_slice(),
+        Expr::Set(set) => set.elts.as_slice(),
+        _ => return None,
+    };
+    elements
+        .iter()
+        .map(|element| match element {
+            Expr::StringLiteral(string) => Some(string.value.to_str().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn has_doc_section(text: &str) -> bool {
     const SECTIONS: [&str; 11] = [
         "Parameters",
@@ -874,10 +1791,10 @@ fn has_emoji(text: &str) -> bool {
     })
 }
 
-/// Whole-word (or whole-phrase) match: the needle occurs with non-alphanumeric characters
-/// on both sides, so "let me" does not fire inside "tablet me" and "clean" would not fire
-/// inside "cleanly". Both arguments are already lowercased.
 fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     let mut from = 0;
     while let Some(rel) = hay[from..].find(needle) {
         let start = from + rel;
@@ -895,99 +1812,172 @@ fn contains_word(hay: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = start + 1;
+        from = start + hay[start..].chars().next().unwrap().len_utf8();
     }
     false
 }
 
-/// A hash of a function body's shape: the sequence of statement kinds plus the names it
-/// calls. Two bodies collide only when they have the same control-flow skeleton and call
-/// the same functions, so a match is strong evidence of copy-paste. Returns the hash and
-/// the statement count.
-fn body_signature(body: &[Stmt]) -> (u64, usize) {
-    struct SigVisitor {
-        tags: Vec<u8>,
-        calls: Vec<String>,
-    }
-    impl<'a> Visitor<'a> for SigVisitor {
-        fn visit_stmt(&mut self, stmt: &'a Stmt) {
-            self.tags.push(stmt_tag(stmt));
-            walk_stmt(self, stmt);
-        }
-        fn visit_expr(&mut self, expr: &'a Expr) {
-            if let Expr::Call(call) = expr {
-                if let Some(name) = callee_name(&call.func) {
-                    self.calls.push(name.to_string());
-                }
-            }
-            walk_expr(self, expr);
-        }
-    }
-    let mut sig = SigVisitor {
-        tags: Vec::new(),
-        calls: Vec::new(),
+fn normalized_body(source: &str, tokens: &[Token], body: &[Stmt]) -> String {
+    let (Some(first), Some(last)) = (body.first(), body.last()) else {
+        return String::new();
     };
-    for stmt in body {
-        sig.visit_stmt(stmt);
+    let start = first.range().start().to_usize();
+    let end = last.range().end().to_usize();
+    let mut normalized = String::new();
+    let first = tokens.partition_point(|token| token.range().end().to_usize() <= start);
+    let last = tokens.partition_point(|token| token.range().start().to_usize() < end);
+    for token in &tokens[first..last] {
+        if matches!(
+            token.kind(),
+            TokenKind::Comment
+                | TokenKind::Newline
+                | TokenKind::NonLogicalNewline
+                | TokenKind::EndOfFile
+        ) {
+            continue;
+        }
+        let range = token.range();
+        let text = &source[range.start().to_usize()..range.end().to_usize()];
+        normalized.push_str(&format!("{:?}", token.kind()));
+        if matches!(
+            token.kind(),
+            TokenKind::Name
+                | TokenKind::Int
+                | TokenKind::Float
+                | TokenKind::Complex
+                | TokenKind::String
+                | TokenKind::FStringMiddle
+                | TokenKind::TStringMiddle
+        ) {
+            normalized.push('=');
+            normalized.push_str(text);
+        }
+        normalized.push(';');
     }
-    let len = sig.tags.len();
-    let mut hasher = DefaultHasher::new();
-    sig.tags.hash(&mut hasher);
-    sig.calls.hash(&mut hasher);
-    (hasher.finish(), len)
+    normalized
 }
 
-fn stmt_tag(stmt: &Stmt) -> u8 {
-    match stmt {
-        Stmt::FunctionDef(_) => 1,
-        Stmt::ClassDef(_) => 2,
-        Stmt::Return(_) => 3,
-        Stmt::Assign(_) => 4,
-        Stmt::AugAssign(_) => 5,
-        Stmt::AnnAssign(_) => 6,
-        Stmt::For(_) => 7,
-        Stmt::While(_) => 8,
-        Stmt::If(_) => 9,
-        Stmt::With(_) => 10,
-        Stmt::Raise(_) => 11,
-        Stmt::Try(_) => 12,
-        Stmt::Assert(_) => 13,
-        Stmt::Import(_) => 14,
-        Stmt::ImportFrom(_) => 15,
-        Stmt::Expr(_) => 16,
-        Stmt::Match(_) => 17,
-        _ => 0,
+fn statement_count(body: &[Stmt]) -> usize {
+    struct Counter(usize);
+    impl<'a> Visitor<'a> for Counter {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            self.0 += 1;
+            if !matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                walk_stmt(self, statement);
+            }
+        }
     }
+    let mut counter = Counter(0);
+    for statement in body {
+        counter.visit_stmt(statement);
+    }
+    counter.0
+}
+
+fn is_forwarder(function: &StmtFunctionDef) -> bool {
+    let body = &function.body[function.body.first().is_some_and(is_docstring) as usize..];
+    let [Stmt::Return(statement)] = body else {
+        return false;
+    };
+    let Some(Expr::Call(call)) = statement.value.as_deref() else {
+        return false;
+    };
+    let mut forwarded = Vec::new();
+    let vararg = function.parameters.vararg.as_ref().map(|p| p.name.as_str());
+    let kwarg = function.parameters.kwarg.as_ref().map(|p| p.name.as_str());
+    for argument in &call.arguments.args {
+        let (expression, starred) = match argument {
+            Expr::Starred(starred) => (starred.value.as_ref(), true),
+            expression => (expression, false),
+        };
+        let Expr::Name(name) = expression else {
+            return false;
+        };
+        let name = name.id.as_str();
+        if starred != (Some(name) == vararg) || Some(name) == kwarg {
+            return false;
+        }
+        forwarded.push(name);
+    }
+    for keyword in &call.arguments.keywords {
+        let Expr::Name(name) = &keyword.value else {
+            return false;
+        };
+        let name = name.id.as_str();
+        if keyword.arg.is_none() != (Some(name) == kwarg) || Some(name) == vararg {
+            return false;
+        }
+        forwarded.push(name);
+    }
+    let mut parameters = all_param_names(&function.parameters);
+    parameters.sort_unstable();
+    forwarded.sort_unstable();
+    forwarded == parameters
+}
+
+fn branch_depth(body: &[Stmt], depth: usize) -> usize {
+    let mut maximum = depth;
+    for statement in body {
+        let nested = match statement {
+            Stmt::If(statement) => {
+                let mut value = branch_depth(&statement.body, depth + 1);
+                for clause in &statement.elif_else_clauses {
+                    value = value.max(branch_depth(&clause.body, depth + 1));
+                }
+                value
+            }
+            Stmt::For(statement) => branch_depth(&statement.body, depth + 1)
+                .max(branch_depth(&statement.orelse, depth + 1)),
+            Stmt::While(statement) => branch_depth(&statement.body, depth + 1)
+                .max(branch_depth(&statement.orelse, depth + 1)),
+            Stmt::With(statement) => branch_depth(&statement.body, depth),
+            Stmt::Try(statement) => {
+                let mut value = branch_depth(&statement.body, depth + 1)
+                    .max(branch_depth(&statement.orelse, depth + 1))
+                    .max(branch_depth(&statement.finalbody, depth + 1));
+                for handler in &statement.handlers {
+                    let ExceptHandler::ExceptHandler(handler) = handler;
+                    value = value.max(branch_depth(&handler.body, depth + 1));
+                }
+                value
+            }
+            Stmt::Match(statement) => statement
+                .cases
+                .iter()
+                .map(|case| branch_depth(&case.body, depth + 1))
+                .max()
+                .unwrap_or(depth),
+            _ => depth,
+        };
+        maximum = maximum.max(nested);
+    }
+    maximum
 }
 
 fn is_test_name(name: &str) -> bool {
     name.starts_with("test_")
 }
 
-fn line_at(source: &str, offset: usize) -> usize {
-    let offset = offset.min(source.len());
-    source.as_bytes()[..offset]
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count()
-        + 1
+fn line_span(locator: &SourceLocator, range: ruff_text_size::TextRange) -> usize {
+    locator.location(range.end().to_usize()).0 - locator.location(range.start().to_usize()).0 + 1
 }
 
-/// The number of source lines a node spans, inclusive.
-fn line_span(source: &str, range: ruff_text_size::TextRange) -> usize {
-    line_at(source, range.end().to_usize()) - line_at(source, range.start().to_usize()) + 1
-}
-
-/// comment-noise is off in `docs`/`doc` trees: their divider characters are reStructuredText
-/// section underlines (a `# -----` under a heading), not hand-drawn separators, and the two
-/// are byte-identical. Other rules still run there; whole paths can be excluded via config.
 fn in_docs(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component.as_os_str().to_str(), Some("docs" | "doc")))
 }
 
-/// A decorative divider: any run of 3+ rule characters, so `# ===`, `# ----`, and
-/// `# --- Section ---` all count, while a single `- bullet` or `x = 1` does not.
+fn is_license_header(source: &str) -> bool {
+    let header = source
+        .lines()
+        .take(25)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_ascii_lowercase();
+    header.contains("copyright")
+        && (header.contains("licensed under") || header.contains("all rights reserved"))
+}
+
 fn has_divider_run(body: &str) -> bool {
     let mut run = 0u32;
     for c in body.chars() {
@@ -1008,336 +1998,279 @@ mod tests {
     use super::*;
 
     fn run(source: &str) -> Vec<String> {
-        let pkgs: HashSet<String> = ["mypkg"].into_iter().map(str::to_string).collect();
-        let banned: Vec<String> = ["seamless", "feel free"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        check_file(Path::new("t.py"), source, &pkgs, &banned)
+        analyze(source)
             .findings
             .into_iter()
-            .map(|f| f.rule.to_string())
+            .map(|finding| finding.rule.name().to_string())
             .collect()
+    }
+
+    fn analyze(source: &str) -> FileResult {
+        analyze_at("test_t.py", source, &["seamless", "feel free"], true)
+    }
+
+    fn analyze_at(path: &str, source: &str, banned: &[&str], is_test_file: bool) -> FileResult {
+        let pkgs: HashSet<String> = ["mypkg"].into_iter().map(str::to_string).collect();
+        let mut config = Config::default();
+        config.banned_words = banned.iter().map(|word| (*word).to_string()).collect();
+        check_file(
+            Path::new(path),
+            source,
+            &FileOptions {
+                package_roots: &pkgs,
+                is_stub_file: false,
+                is_test_file,
+                cell: None,
+                config: &config,
+            },
+        )
+        .unwrap()
     }
 
     fn count(source: &str, rule: &str) -> usize {
         run(source).iter().filter(|r| *r == rule).count()
     }
 
-    #[test]
-    fn fallback_import_and_assign() {
-        assert_eq!(
-            count(
-                "try:\n    import a as m\nexcept ImportError:\n    import b as m\n",
-                "guard-fallback"
-            ),
-            1
-        );
-        assert_eq!(
-            count(
-                "try:\n    x = fast()\nexcept Exception:\n    x = slow()\n",
-                "guard-fallback"
-            ),
-            1
-        );
-        assert_eq!(
-            count(
-                "try:\n    x = fast()\nexcept Exception:\n    raise\n",
-                "guard-fallback"
-            ),
-            0
-        );
+    fn check_counts(rule: &str, cases: &[(&str, usize)]) {
+        for &(source, expected) in cases {
+            assert_eq!(count(source, rule), expected, "{source:?}");
+        }
     }
 
     #[test]
-    fn silent_default_skips_optional_arg_idiom() {
-        // cfg is a local, not a parameter: masking a value, flagged
-        assert_eq!(
-            count(
-                "def f():\n    if cfg is None:\n        cfg = default()\n",
-                "guard-silent-default"
-            ),
-            1
+    fn behavioral_rules() {
+        check_counts(
+            "guard-fallback",
+            &[
+                ("try:\n    import a as m\nexcept ImportError:\n    import b as m\n", 1),
+                ("try:\n    x = fast()\nexcept Exception:\n    x = slow()\n", 1),
+                ("try:\n    self.x = fast()\nexcept Exception:\n    self.x = slow()\n", 1),
+                ("try:\n    cache[key] = fast()\nexcept Exception:\n    cache[key] = slow()\n", 1),
+                ("try:\n    x = fast()\nexcept Exception:\n    raise\n", 0),
+                ("try:\n    x = fast()\nexcept Exception:\n    def fail_later():\n        raise RuntimeError\n    x = slow()\n", 1),
+            ],
         );
-        // a parameter with a literal =None default: the idiom, not flagged
-        assert_eq!(
-            count(
-                "def f(x=None):\n    if x is None:\n        x = []\n",
-                "guard-silent-default"
-            ),
-            0
+        check_counts(
+            "guard-silent-default",
+            &[
+                ("def f():\n    if cfg is None:\n        cfg = default()\n", 1),
+                ("def f(x=None):\n    if x is None:\n        x = []\n", 0),
+                ("def f(x):\n    if x is None:\n        x = compute()\n", 0),
+                ("def f(x):\n    return torch.nan_to_num(x)\n", 1),
+                ("def f(x):\n    y = g(torch.nan_to_num(x))\n    return y\n", 1),
+                ("def f():\n    if ready:\n        return value\n    elif cfg is None:\n        cfg = default()\n    return cfg\n", 1),
+            ],
         );
-        // a parameter without a literal default (e.g. fed None by a decorator): also the idiom
-        assert_eq!(
-            count(
-                "def f(x):\n    if x is None:\n        x = compute()\n",
-                "guard-silent-default"
-            ),
-            0
+        check_counts(
+            "test-weak",
+            &[
+                ("def test_a():\n    assert isinstance(x, int)\n", 1),
+                ("def test_b():\n    assert x.shape == (3,)\n", 1),
+                ("def test_dtype():\n    assert x.dtype == dtype\n", 1),
+                ("def test_ndim():\n    assert x.ndim == 2\n", 1),
+                ("def test_axis():\n    assert x.shape[0] == 3\n", 1),
+                ("def test_method():\n    self.assertEqual(x.shape, expected)\n", 1),
+                ("def test_c():\n    assert x.shape == (3,)\n    assert y == 5\n", 0),
+                ("def test_d():\n    assert x.shape == (3,)\n    np.testing.assert_allclose(x, y)\n", 0),
+                ("def test_nothing():\n    x = compute()\n", 1),
+                ("def test_fake():\n    helper.raises()\n", 1),
+                ("from pytest import raises\ndef test_error():\n    with raises(ValueError):\n        fail()\n", 0),
+                ("def test_local():\n    from pytest import raises\n    with raises(ValueError):\n        fail()\n", 0),
+                ("def test_unused():\n    def helper():\n        assert result == expected\n    compute()\n", 1),
+            ],
         );
-    }
-
-    #[test]
-    fn silent_default_nan_fill() {
-        assert_eq!(
-            count(
-                "def f(x):\n    return torch.nan_to_num(x)\n",
-                "guard-silent-default"
-            ),
-            1
+        let result = analyze(
+            "import unittest.mock\ndef test_patch(mocker):\n    from unittest.mock import PropertyMock\n    unittest.mock.Mock()\n    PropertyMock()\n    mocker.spy(target, 'method')\n    unittest.mock.patch.dict(values, {})\n    with unittest.mock.patch('other.value'):\n        assert value == 1\n",
         );
-        // nested in a call argument: still caught (the statement-level check missed this)
-        assert_eq!(
-            count(
-                "def f(x):\n    y = g(torch.nan_to_num(x))\n    return y\n",
-                "guard-silent-default"
-            ),
-            1
+        assert_eq!(result.mock_calls, 5);
+        check_counts(
+            "test-mock-sut",
+            &[
+                (
+                    "def test_t(monkeypatch):\n    monkeypatch.setattr('mypkg.mod.t', g)\n",
+                    1,
+                ),
+                (
+                    "def test_b(monkeypatch):\n    monkeypatch.setattr('requests.get', g)\n",
+                    0,
+                ),
+            ],
         );
-    }
-
-    #[test]
-    fn test_weak_only_when_no_value_assert() {
-        assert_eq!(
-            count(
-                "def test_a():\n    assert isinstance(x, int)\n",
-                "test-weak"
-            ),
-            1
-        );
-        assert_eq!(
-            count("def test_b():\n    assert x.shape == (3,)\n", "test-weak"),
-            1
-        );
-        assert_eq!(
-            count(
-                "def test_c():\n    assert x.shape == (3,)\n    assert y == 5\n",
-                "test-weak"
-            ),
-            0
-        );
-        // a value-checking assertion CALL is strong, even beside a weak `assert`
-        assert_eq!(
-            count(
-                "def test_d():\n    assert x.shape == (3,)\n    np.testing.assert_allclose(x, y)\n",
-                "test-weak"
-            ),
-            0
-        );
-    }
-
-    #[test]
-    fn mock_sut_first_party_only() {
-        assert_eq!(
-            count(
-                "def test_a(monkeypatch):\n    monkeypatch.setattr('mypkg.mod.f', g)\n",
-                "test-mock-sut"
-            ),
-            1
-        );
-        assert_eq!(
-            count(
-                "def test_b(monkeypatch):\n    monkeypatch.setattr('requests.get', g)\n",
-                "test-mock-sut"
-            ),
-            0
-        );
-    }
-
-    #[test]
-    fn comment_noise_changelog_and_divider() {
-        assert_eq!(count("x = 1  # used to be 2\n", "comment-noise"), 1);
-        assert_eq!(count("x = 1  # renamed from old_x\n", "comment-noise"), 1);
-        // "used to" in the employed-to sense is not a changelog comment
-        assert_eq!(
-            count("y = f(x)  # used to derive the result\n", "comment-noise"),
-            0
-        );
-        // dropped phrases: too loose, fired on runtime/algorithm descriptions
-        assert_eq!(
-            count("x = 1  # the previously cached value\n", "comment-noise"),
-            0
-        );
-        assert_eq!(
-            count("x = 1  # no longer pinned at runtime\n", "comment-noise"),
-            0
-        );
-        assert_eq!(count("# ===\nx = 1\n", "comment-noise"), 1);
-        assert_eq!(count("# --- Section ---\nx = 1\n", "comment-noise"), 1);
-        assert_eq!(
-            count("# explains why x is needed\nx = 1\n", "comment-noise"),
-            0
-        );
-        assert_eq!(
-            count("# - a single-dash bullet\nx = 1\n", "comment-noise"),
-            0
-        );
-    }
-
-    #[test]
-    fn comment_noise_off_in_docs() {
-        // a divider in a doc tree is an rST section underline, not noise
-        let pkgs = HashSet::new();
-        let result = check_file(
-            Path::new("docs/examples/tour.py"),
-            "# ---\nx = 1\n",
-            &pkgs,
+        let result = analyze_at(
+            "tests/unit/test_model.py",
+            "def test_load(monkeypatch):\n    monkeypatch.setattr('mypkg.model.load', fake)\n",
             &[],
-        );
-        assert!(result.findings.iter().all(|f| f.rule != "comment-noise"));
-    }
-
-    #[test]
-    fn stub_bodies_flagged_concrete_only() {
-        assert_eq!(count("def f():\n    pass\n", "stub"), 1);
-        assert_eq!(count("def f():\n    ...\n", "stub"), 1);
-        assert_eq!(
-            count("def f():\n    raise NotImplementedError\n", "stub"),
-            1
+            true,
         );
         assert_eq!(
-            count("def f():\n    raise NotImplementedError()\n", "stub"),
-            1
-        );
-        // a message means a real boundary, not a stub
-        assert_eq!(
-            count(
-                "def f():\n    raise NotImplementedError('no cuda')\n",
-                "stub"
-            ),
-            0
-        );
-        // a real body is not a stub
-        assert_eq!(count("def f():\n    return 1 + 1\n", "stub"), 0);
-    }
-
-    #[test]
-    fn stub_skips_overload_abstract_and_protocol() {
-        assert_eq!(count("@overload\ndef f(x): ...\n", "stub"), 0);
-        assert_eq!(
-            count(
-                "class C(ABC):\n    @abstractmethod\n    def f(self): ...\n",
-                "stub"
-            ),
-            0
-        );
-        assert_eq!(
-            count("class P(Protocol):\n    def f(self): ...\n", "stub"),
-            0
-        );
-        // a plain class with a stub method is still flagged
-        assert_eq!(
-            count("class C:\n    def f(self):\n        pass\n", "stub"),
-            1
-        );
-        // a non-abstract `pass` method in an ABC is not exempt; only the @abstractmethod one is
-        assert_eq!(
-            count(
-                "class C(ABC):\n    @abstractmethod\n    def a(self): ...\n    def b(self):\n        pass\n",
-                "stub"
-            ),
+            result
+                .findings
+                .iter()
+                .filter(|f| f.rule == Rule::TestMockSut)
+                .count(),
             1
         );
     }
 
     #[test]
-    fn banned_word_in_docstring_and_comment() {
-        assert_eq!(
-            count(
-                "def f():\n    \"\"\"A seamless helper.\"\"\"\n    return 1\n",
-                "banned-word"
-            ),
-            1
+    fn source_rules() {
+        check_counts(
+            "comment-noise",
+            &[
+                ("x = 1  # used to be 2\n", 1),
+                ("# ===\nx = 1\n", 1),
+                ("# explains why x is needed\nx = 1\n", 0),
+            ],
         );
-        assert_eq!(count("x = 1  # feel free to tweak\n", "banned-word"), 1);
-        // a plain word that contains a banned substring is not matched
-        assert_eq!(
-            count(
-                "def f():\n    \"\"\"Seamlessness aside.\"\"\"\n    return 1\n",
-                "banned-word"
-            ),
-            0
+        let result = analyze_at("docs/examples/tour.py", "# ---\nx = 1\n", &[], false);
+        assert!(result.findings.iter().all(|f| f.rule != Rule::CommentNoise));
+        let source = "# Copyright 2026 Example. All Rights Reserved.\n#\n# Licensed under the Apache License, Version 2.0.\n# ================================================\nx = 1\n";
+        assert_eq!(count(source, "comment-noise"), 0);
+        check_counts(
+            "stub",
+            &[
+                ("def f():\n    pass\n", 1),
+                ("def f():\n    raise NotImplementedError('no cuda')\n", 0),
+                ("@overload\ndef f(x): ...\n", 0),
+                ("class P(Protocol):\n    def f(self): ...\n", 0),
+                ("class C:\n    def f(self):\n        pass\n", 1),
+            ],
         );
-    }
-
-    #[test]
-    fn banned_word_emoji() {
+        check_counts(
+            "banned-word",
+            &[
+                (
+                    "def f():\n    \"\"\"A seamless helper.\"\"\"\n    return 1\n",
+                    1,
+                ),
+                (
+                    "def f():\n    \"\"\"Seamlessness aside.\"\"\"\n    return 1\n",
+                    0,
+                ),
+                ("def seamless_helper(x):\n    return x\n", 1),
+            ],
+        );
         let n = run("def f():\n    \"\"\"Done \u{2705}\"\"\"\n    return 1\n")
             .iter()
             .filter(|r| *r == "banned-word")
             .count();
         assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn banned_word_in_identifiers() {
-        // function name
-        assert_eq!(
-            count("def seamless_helper(x):\n    return x\n", "banned-word"),
-            1
-        );
-        // class name (camelCase split)
-        assert_eq!(count("class SeamlessThing:\n    pass\n", "banned-word"), 1);
-        // for-loop target
-        assert_eq!(count("for seamless in xs:\n    pass\n", "banned-word"), 1);
-        // attribute name
-        assert_eq!(count("obj.seamless = 1\n", "banned-word"), 1);
-        // comprehension variable
-        assert_eq!(
-            count("ys = [seamless for seamless in xs]\n", "banned-word"),
-            2
-        );
-        // whole-token only: 'seamlessly' is a different token, not a match
-        assert_eq!(
-            count("def seamlessly(x):\n    return x\n", "banned-word"),
-            0
-        );
-    }
-
-    #[test]
-    fn banned_word_not_skipped_in_docs() {
-        let pkgs = HashSet::new();
-        let banned = vec!["seamless".to_string()];
-        let result = check_file(
-            Path::new("docs/examples/tour.py"),
+        let result = analyze_at(
+            "docs/examples/tour.py",
             "\"\"\"A seamless tour.\"\"\"\n",
-            &pkgs,
-            &banned,
+            &["seamless"],
+            false,
         );
-        assert!(result.findings.iter().any(|f| f.rule == "banned-word"));
-    }
-
-    #[test]
-    fn doc_bloat_only_padding_without_sections() {
-        // tiny function, long sectionless docstring: padding
+        assert!(result.findings.iter().any(|f| f.rule == Rule::BannedWord));
         let padded = "def f():\n    \"\"\"Line.\n    Line.\n    Line.\n    Line.\n    Line.\n    Line.\n    Line.\n    Line.\n    \"\"\"\n    return 1\n";
         assert_eq!(count(padded, "doc-bloat"), 1);
-        // same length but with a Returns section: real API doc
         let sectioned = "def f():\n    \"\"\"Line.\n    Line.\n    Line.\n    Line.\n    Returns:\n        int: one.\n    Line.\n    Line.\n    \"\"\"\n    return 1\n";
         assert_eq!(count(sectioned, "doc-bloat"), 0);
-    }
-
-    #[test]
-    fn contains_word_respects_boundaries() {
         assert!(contains_word("a seamless thing", "seamless"));
         assert!(!contains_word("seamlessness", "seamless"));
-        assert!(contains_word("cutting-edge tech", "cutting-edge"));
-        assert!(!contains_word("tablet me now", "let me"));
-        assert!(contains_word("let me explain", "let me"));
+        assert!(!contains_word("a\u{e9}x", "\u{e9}"));
     }
 
     #[test]
-    fn body_signature_separates_calls() {
-        let (a, _) = sig_of("x = foo()\n");
-        let (b, _) = sig_of("x = bar()\n");
-        let (c, _) = sig_of("x = foo()\n");
-        assert_ne!(a, b, "different calls should differ");
-        assert_eq!(a, c, "identical bodies should match");
+    fn repository_analysis() {
+        let (add, _) = sig_of("x = 1\ny = 2\nz = 3\nq = 4\nreturn x + y\n");
+        let (multiply, _) = sig_of("x = 10\ny = 20\nz = 30\nq = 40\nreturn x * y\n");
+        assert_ne!(add, multiply);
+        let key = sig_of("a = 1\nb = 2\nc = 3\nd = 4\nreturn sink(key=a)\n");
+        let option = sig_of("a = 1\nb = 2\nc = 3\nd = 4\nreturn sink(option=a)\n");
+        assert_ne!(key, option);
+        let outside = sig_of("if x:\n    a()\nb()\n");
+        let inside = sig_of("if x:\n    a()\n    b()\n");
+        assert_ne!(outside, inside);
+        let result = analyze_at(
+            "m.py",
+            "def _forward(x, *args, **kwargs):\n    \"\"\"Forward.\"\"\"\n    return target(x, *args, **kwargs)\ndef run(x):\n    _forward(x)\n    _forward(x)\nclass C:\n    def method(self, x):\n        _forward(x)\ndef shadow(x):\n    from other import _forward\n    _forward(x)\ndef assign(x):\n    _forward = other\n    _forward(x)\ndef context(ctx, x):\n    with ctx as _forward:\n        _forward(x)\ndef handle(x):\n    try:\n        fail()\n    except Exception as _forward:\n        _forward(x)\ndef lambdas(other, x):\n    return (lambda _forward: _forward(x))(other)\ndef lambda_outer(other, x):\n    (lambda _forward: 0)(other)\n    return _forward(x)\ndef comp(xs, x):\n    return [_forward(x) for _forward in xs]\ndef comp_outer(xs, x):\n    [_forward for _forward in xs]\n    return _forward(x)\ndef first(xs, x):\n    return [_forward for _forward in _forward(xs)]\ndef defaults(x):\n    def inner(_forward=_forward(x)):\n        pass\ndef decorators(x):\n    @_forward(x)\n    def inner():\n        pass\ndef named(other, x):\n    (_forward := other)\n    return _forward(x)\ndef matched(other, x):\n    match other:\n        case _ as _forward:\n            return _forward(x)\ndef outer():\n    _forward = other\n    def inner(x):\n        global _forward\n        return _forward(x)\ndef header_default(x):\n    def inner(value=(_forward := other)):\n        pass\n    return _forward(x)\ndef lambda_default(x):\n    fn = lambda value=(_forward := other): value\n    return _forward(x)\ndef class_base(x):\n    class Inner((_forward := Base)):\n        pass\n    return _forward(x)\nclass Plain:\n    value = _forward(x)\nclass Before:\n    value = _forward(x)\n    _forward = other\nclass After:\n    _forward = other\n    value = _forward(x)\nclass ImportBefore:\n    value = _forward(x)\n    from other import _forward\nclass ImportAfter:\n    from other import _forward\n    value = _forward(x)\n",
+            &[],
+            false,
+        );
+        assert!(result.func_sigs[0].is_forwarder);
+        assert_eq!(
+            result.callers["m._forward"],
+            HashSet::from([
+                "m.run".to_string(),
+                "m.C.method".to_string(),
+                "m.lambda_outer".to_string(),
+                "m.comp_outer".to_string(),
+                "m.first".to_string(),
+                "m.defaults".to_string(),
+                "m.decorators".to_string(),
+                "m.outer.inner".to_string(),
+                "m.Plain".to_string(),
+            ])
+        );
+        assert!(result.ambiguous_calls.contains("m._forward"));
+        let nonlocal = analyze_at("b.py", "def outer():\n    from a import _forward\n    def inner(x):\n        nonlocal _forward\n        return _forward(x)\n", &[], false);
+        assert!(nonlocal.ambiguous_calls.contains("a._forward"));
+        let star = analyze_at("m.py", "def _forward(x):\n    return target(x)\nfrom other import *\ndef run(x):\n    return _forward(x)\n", &[], false);
+        assert!(!star.func_sigs[0].is_forwarder);
+        assert!(star.ambiguous_calls.contains("*"));
+        let postponed = analyze_at("m.py", "from __future__ import annotations\ndef _forward(x):\n    return target(x)\ndef run(x: _forward(T)):\n    pass\n", &[], false);
+        assert!(!postponed.callers.contains_key("m._forward"));
+        let escaped = analyze_at("m.py", "def _forward(x):\n    return target(x)\nalias = _forward\ndef run(x):\n    return _forward(x)\n", &[], false);
+        assert!(escaped.ambiguous_calls.contains("m._forward"));
+        let imported = analyze_at(
+            "b.py",
+            "from a import _forward\nalias = _forward\ndef direct(x):\n    return _forward(x)\n",
+            &[],
+            false,
+        );
+        assert!(imported.ambiguous_calls.contains("a._forward"));
+        let qualified = analyze_at(
+            "b.py",
+            "import a\nalias = a._forward\ndef direct(x):\n    return a._forward(x)\n",
+            &[],
+            false,
+        );
+        assert!(qualified.ambiguous_calls.contains("a._forward"));
+        let decorated = analyze_at("m.py", "@atexit.register\ndef _forward(*args, **kwargs):\n    return target(*args, **kwargs)\ndef run():\n    _forward()\n", &[], false);
+        assert!(!decorated.func_sigs[0].is_forwarder);
+        let parsed = parse_module(
+            "from pkg import first\nimport other as second\ninternal = 1\n__all__ = ['first']\n",
+        )
+        .unwrap();
+        assert_eq!(module_public_symbols(&parsed.syntax().body), Some(1));
+
+        let parsed = parse_module("from pkg import first\nimport other as second\n").unwrap();
+        assert_eq!(module_public_symbols(&parsed.syntax().body), Some(2));
+
+        let parsed = parse_module("from pkg import *\n").unwrap();
+        assert_eq!(module_public_symbols(&parsed.syntax().body), None);
+        let parsed = parse_module("from __future__ import annotations\n").unwrap();
+        assert_eq!(module_public_symbols(&parsed.syntax().body), Some(0));
+        let parsed = parse_module("def f():\n    with a():\n        with b():\n            with c():\n                return value\n").unwrap();
+        let Stmt::FunctionDef(function) = &parsed.syntax().body[0] else {
+            unreachable!()
+        };
+        assert_eq!(branch_depth(&function.body, 0), 0);
+        let result = analyze("def seamless():\n    return 1\n");
+        let finding = result
+            .findings
+            .iter()
+            .find(|finding| finding.rule == Rule::BannedWord)
+            .unwrap();
+        let span = finding.span.unwrap();
+        assert_eq!((span.line, span.column, span.end_line), (1, 5, 1));
     }
 
-    fn sig_of(src: &str) -> (u64, usize) {
-        let parsed = parse_module(src).unwrap();
-        body_signature(&parsed.syntax().body)
+    fn sig_of(src: &str) -> (String, usize) {
+        let body = src
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+        let wrapped = format!("def f():\n{body}");
+        let parsed = parse_module(&wrapped).unwrap();
+        let Stmt::FunctionDef(function) = &parsed.syntax().body[0] else {
+            unreachable!()
+        };
+        (
+            normalized_body(&wrapped, parsed.tokens(), &function.body),
+            statement_count(&function.body),
+        )
     }
 
     #[test]
@@ -1346,14 +2279,27 @@ mod tests {
         assert!(info.is_abstract);
         let info = first_class("class C(ABC):\n    @abstractmethod\n    def f(self): ...\n");
         assert!(info.is_abstract);
+        let info = first_class("class C(ABC):\n    pass\n");
+        assert!(!info.is_abstract);
         let info = first_class("class D(Base):\n    x = 1\n");
         assert!(!info.is_abstract);
-        assert_eq!(info.bases, vec!["Base".to_string()]);
+        assert_eq!(info.bases, vec!["t.Base".to_string()]);
+        assert_eq!(
+            module_name(Path::new("packages/core/src/pkg/a.py")),
+            "pkg.a"
+        );
+        let result = analyze_at(
+            "t.py",
+            "class Left:\n    class Base: pass\nclass Right:\n    class Base: pass\n",
+            &[],
+            false,
+        );
+        assert_eq!(result.classes[1].qualified_name, "t.Left.Base");
+        assert_eq!(result.classes[3].qualified_name, "t.Right.Base");
     }
 
     fn first_class(src: &str) -> ClassInfo {
-        let pkgs = HashSet::new();
-        check_file(Path::new("t.py"), src, &pkgs, &[])
+        analyze_at("t.py", src, &[], false)
             .classes
             .into_iter()
             .next()

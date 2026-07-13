@@ -7,7 +7,8 @@ mod rules;
 mod scan;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use finding::{Rule, ALL_RULES};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -23,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check the given files or directories for bloat
+    /// Check files or directories
     Check {
         /// Files or directories to check (defaults to the current directory)
         paths: Vec<PathBuf>,
@@ -34,55 +35,122 @@ enum Command {
         #[arg(long)]
         statistics: bool,
     },
+    /// Explain one rule, or list every rule when no selector is supplied
+    Explain { rule: Option<String> },
+    /// Print the effective configuration as JSON
+    ShowSettings { path: Option<PathBuf> },
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum)]
 enum OutputFormat {
     Text,
     Json,
+    Sarif,
+    Github,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    match run(Cli::parse()) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("balinter: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
 
+fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
+        Command::Explain { rule } => {
+            explain(rule.as_deref())?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::ShowSettings { path } => {
+            let path = path.unwrap_or_else(|| PathBuf::from("."));
+            let canonical = canonical_existing(&path)?;
+            let start = if canonical.is_file() {
+                canonical.parent().unwrap_or(&canonical)
+            } else {
+                &canonical
+            };
+            let (root, config) = config::Config::discover(start)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&config.settings_json(&root))
+                    .map_err(|error| format!("could not serialize settings: {error}"))?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Check {
             paths,
             output_format,
             statistics,
         } => {
+            if statistics && matches!(output_format, OutputFormat::Sarif | OutputFormat::Github) {
+                return Err("--statistics supports only text and JSON output".to_string());
+            }
             let paths = if paths.is_empty() {
                 vec![PathBuf::from(".")]
             } else {
                 paths
             };
-            for path in &paths {
-                if !path.exists() {
-                    eprintln!("balinter: path does not exist: {}", path.display());
-                    return ExitCode::from(2);
-                }
-            }
-
-            // Config is discovered by walking up from the first path, then applied to all.
-            let cfg_root = std::fs::canonicalize(&paths[0]).unwrap_or_else(|_| paths[0].clone());
-            let cfg = config::Config::discover(&cfg_root);
-
-            let mut files = Vec::new();
-            for path in &paths {
-                let root = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
-                files.extend(scan::scan(&root, &cfg).files);
-            }
-            let scan = scan::Scan { files };
-
-            let findings = rules::evaluate(&scan, &cfg);
-            let json = matches!(output_format, OutputFormat::Json);
-            report::print(&scan, &findings, json, statistics);
-
-            if findings.is_empty() {
+            let common = common_input_root(&paths)?;
+            let (root, config) = config::Config::discover(&common)?;
+            let scan = scan::scan(&root, &paths, &config)?;
+            let findings = rules::evaluate(&scan, &config);
+            report::print(&scan, &findings, output_format, statistics)?;
+            Ok(if findings.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
+            })
+        }
+    }
+}
+
+fn explain(selector: Option<&str>) -> Result<(), String> {
+    if let Some(selector) = selector {
+        let rule = Rule::parse(selector).ok_or_else(|| format!("unknown rule {selector:?}"))?;
+        println!("{} {}\n{}", rule.code(), rule.name(), rule.explanation());
+    } else {
+        for rule in ALL_RULES {
+            println!(
+                "{}  {:<22} {}",
+                rule.code(),
+                rule.name(),
+                rule.explanation()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn common_input_root(paths: &[PathBuf]) -> Result<PathBuf, String> {
+    let mut bases = paths
+        .iter()
+        .map(|path| {
+            let canonical = canonical_existing(path)?;
+            Ok(if canonical.is_dir() {
+                canonical
+            } else {
+                canonical.parent().unwrap_or(Path::new("/")).to_path_buf()
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut common = bases
+        .pop()
+        .ok_or_else(|| "no input paths were supplied".to_string())?;
+    for base in bases {
+        while !base.starts_with(&common) {
+            if !common.pop() {
+                return Err("input paths do not share a filesystem root".to_string());
             }
         }
     }
+    Ok(common)
+}
+
+fn canonical_existing(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("could not access {}: {error}", path.display()))
 }

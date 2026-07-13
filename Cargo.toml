@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "Opinionated linter for sprawling research codebases"
 license = "MIT"
+exclude = [".github", ".gitignore", ".pre-commit-hooks.yaml", "SCRATCHPAD.md", "about.hbs", "about.toml", "tests"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+encoding_rs = "0.8"
 globset = "0.4"
 ignore = "0.4"
 rayon = "1"
