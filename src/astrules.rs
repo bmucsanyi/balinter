@@ -130,7 +130,7 @@ pub fn check_file(
             checker.func_sigs.push(FuncSig {
                 name: func.name.as_str().to_string(),
                 qualified_name: format!("{}.{}", module_name(path), func.name.as_str()),
-                normalized_body: normalized_body(source, parsed.tokens(), &func.body),
+                normalized_body: normalized_body(parsed.tokens(), &func.body),
                 body_len: statement_count(&func.body),
                 is_forwarder: module_functions.contains(func.name.as_str())
                     && func.decorator_list.is_empty()
@@ -1817,7 +1817,7 @@ fn contains_word(hay: &str, needle: &str) -> bool {
     false
 }
 
-fn normalized_body(source: &str, tokens: &[Token], body: &[Stmt]) -> String {
+fn normalized_body(tokens: &[Token], body: &[Stmt]) -> String {
     let (Some(first), Some(last)) = (body.first(), body.last()) else {
         return String::new();
     };
@@ -1836,22 +1836,7 @@ fn normalized_body(source: &str, tokens: &[Token], body: &[Stmt]) -> String {
         ) {
             continue;
         }
-        let range = token.range();
-        let text = &source[range.start().to_usize()..range.end().to_usize()];
         normalized.push_str(&format!("{:?}", token.kind()));
-        if matches!(
-            token.kind(),
-            TokenKind::Name
-                | TokenKind::Int
-                | TokenKind::Float
-                | TokenKind::Complex
-                | TokenKind::String
-                | TokenKind::FStringMiddle
-                | TokenKind::TStringMiddle
-        ) {
-            normalized.push('=');
-            normalized.push_str(text);
-        }
         normalized.push(';');
     }
     normalized
@@ -2178,7 +2163,9 @@ mod tests {
         assert_ne!(add, multiply);
         let key = sig_of("a = 1\nb = 2\nc = 3\nd = 4\nreturn sink(key=a)\n");
         let option = sig_of("a = 1\nb = 2\nc = 3\nd = 4\nreturn sink(option=a)\n");
-        assert_ne!(key, option);
+        assert_eq!(key, option);
+        let renamed = sig_of("p = 1\nq = 2\nr = 3\ns = 4\nreturn sink(key=p)\n");
+        assert_eq!(key, renamed);
         let outside = sig_of("if x:\n    a()\nb()\n");
         let inside = sig_of("if x:\n    a()\n    b()\n");
         assert_ne!(outside, inside);
@@ -2268,7 +2255,7 @@ mod tests {
             unreachable!()
         };
         (
-            normalized_body(&wrapped, parsed.tokens(), &function.body),
+            normalized_body(parsed.tokens(), &function.body),
             statement_count(&function.body),
         )
     }
