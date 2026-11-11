@@ -5,6 +5,10 @@ use crate::scan::Scan;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// A rate per thousand lines is measured once there are a thousand lines.
+/// Below that, one function moves the rate by more than the limit allows.
+const DENSITY_MIN_LOC: usize = 1000;
+
 pub fn evaluate(scan: &Scan, cfg: &Config) -> Vec<Finding> {
     let mut findings = Vec::new();
     let (mut total_loc, mut prod_loc, mut test_loc) = (0, 0, 0);
@@ -62,7 +66,7 @@ pub fn evaluate(scan: &Scan, cfg: &Config) -> Vec<Finding> {
             format!("repo is {total_loc} lines (limit {})", cfg.repo_max_loc),
         ));
     }
-    if cfg.rule_enabled(Rule::BloatDensity, ".") && prod_loc > 0 {
+    if cfg.rule_enabled(Rule::BloatDensity, ".") && prod_loc >= DENSITY_MIN_LOC {
         let density = 1000.0 * function_count as f64 / prod_loc as f64;
         if density > cfg.max_funcs_per_kloc {
             findings.push(Finding::project(
@@ -500,6 +504,12 @@ mod tests {
             rules(vec![module]),
             vec![Rule::BloatDensity, Rule::ModuleApi]
         );
+
+        let mut small = file("m.py", 999, false, 0, 0);
+        small.func_sigs = (0..30)
+            .map(|i| sig(&format!("fn_{i}"), i as u64, 1))
+            .collect();
+        assert!(!rules(vec![small]).contains(&Rule::BloatDensity));
     }
 
     #[test]

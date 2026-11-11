@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/balinter.svg)](https://pypi.org/project/balinter/)
 [![CI](https://github.com/bmucsanyi/balinter/actions/workflows/ci.yml/badge.svg)](https://github.com/bmucsanyi/balinter/actions/workflows/ci.yml)
 
-Balint's opinionated linter for sprawling research codebases. Ruff checks syntax and ty checks types; `balinter` checks repository growth, over-decomposition, duplicate helpers, placeholder scaffolding, weak tests, fallback paths, silent defaults, oversized units, broad module APIs, and low-information prose.
+Balint's opinionated linter for sprawling research codebases. Ruff checks syntax and ty checks types but neither of these can catch bloat or "AI slop". `balinter` was written to fill in exactly that gap: repository growth, over-decomposition, duplicate helpers, weak tests, fallbacks everywhere, and silent defaults, among others.
 
 ## Install
 
@@ -11,7 +11,7 @@ Balint's opinionated linter for sprawling research codebases. Ruff checks syntax
 pip install balinter
 ```
 
-Platform wheels contain a Rust binary; releases also provide a source distribution.
+Platform wheels contain a Rust binary. Releases also provide a source distribution.
 
 ## Use
 
@@ -27,7 +27,7 @@ balinter explain BAL015
 balinter show-settings
 ```
 
-Exit codes are 0 for no findings, 1 for findings, and 2 for invalid runs. Explicit paths bypass VCS and hidden-file filters; configured excludes still apply. Python encoding declarations, `.pyi` files, and Python notebook cells are supported. Non-Python cell magics are skipped.
+Exit codes are 0 for no findings, 1 for findings, and 2 for invalid runs.
 
 ## Rules
 
@@ -35,7 +35,7 @@ Exit codes are 0 for no findings, 1 for findings, and 2 for invalid runs. Explic
 |---|---|---|
 | BAL001 | bloat-repo | repository physical-line limit |
 | BAL002 | bloat-file | file physical-line limit |
-| BAL003 | bloat-density | top-level functions per 1k production lines |
+| BAL003 | bloat-density | top-level functions per 1k production lines, from 1k lines on |
 | BAL004 | dup-family | functions sharing a two-token name suffix |
 | BAL005 | test-mock | resolved mock calls per test |
 | BAL006 | test-absent | test-to-production line ratio |
@@ -58,7 +58,7 @@ Exit codes are 0 for no findings, 1 for findings, and 2 for invalid runs. Explic
 
 ## Configure
 
-Settings come from `[tool.balinter]` in `pyproject.toml`, overridden by `balinter.toml`. Unknown keys, selectors, ranges, unreadable files, and malformed TOML are errors.
+Settings come from `[tool.balinter]` in `pyproject.toml`, overridden by `balinter.toml`.
 
 ```toml
 select = ["BAL007", "stub"]          # replacement selection
@@ -74,8 +74,6 @@ exclude = ["docs", "tests/fixtures", "**/_generated.py"]
 [per_file_ignores]
 "tests/**" = ["BAL013"]
 ```
-
-Plain excluded names match at any depth; slashed paths include descendants; globs use project-relative paths.
 
 ## Suppress
 
